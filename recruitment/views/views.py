@@ -251,7 +251,6 @@ def recruitment(request):
                     redirect=reverse("pipeline"),
                 )
             return HttpResponse("<script>location.reload();</script>")
-    print(dynamic)
     return render(
         request, "recruitment/recruitment_form.html", {"form": form, "dynamic": dynamic}
     )
@@ -1650,6 +1649,7 @@ def candidate_conversion(request, cand_id, **kwargs):
             email=can_mail,
             phone=can_mob,
             gender=can_gender,
+            is_directly_converted=True,
         )
         candidate_obj.converted_employee_id = new_employee
         candidate_obj.save()

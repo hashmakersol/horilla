@@ -2317,6 +2317,8 @@ def employee_export(_):
     field_names.remove("employee_user_id")
     field_names.remove("employee_profile")
     field_names.remove("additional_info")
+    field_names.remove("is_from_onboarding")
+    field_names.remove("is_directly_converted")
     field_names.remove("is_active")
 
     # Get the existing employee data and convert it to a DataFrame
@@ -3387,7 +3389,7 @@ def organisation_chart(request):
                     {
                         "name": employee.get_full_name(),
                         "title": getattr(
-                            employee.get_job_position(), "job_position", "Not set"
+                            employee.get_job_position(), "job_position", _("Not set")
                         ),
                         "children": create_hierarchy(employee),
                     }
@@ -3399,7 +3401,7 @@ def organisation_chart(request):
                     {
                         "name": employee.get_full_name(),
                         "title": getattr(
-                            employee.get_job_position(), "job_position", "Not set"
+                            employee.get_job_position(), "job_position", _("Not set")
                         ),
                         "className": "middle-level",
                         "children": create_hierarchy(employee),
@@ -3415,7 +3417,7 @@ def organisation_chart(request):
         manager = Employee.objects.get(id=manager_id)
         node = {
             "name": manager.get_full_name(),
-            "title": getattr(manager.get_job_position(), "job_position", "Not set"),
+            "title": getattr(manager.get_job_position(), "job_position", _("Not set")),
             "children": create_hierarchy(manager),
         }
         context = {"act_datasource": node}
@@ -3423,7 +3425,7 @@ def organisation_chart(request):
 
     node = {
         "name": manager.get_full_name(),
-        "title": getattr(manager.get_job_position(), "job_position", "Not set"),
+        "title": getattr(manager.get_job_position(), "job_position", _("Not set")),
         "children": create_hierarchy(manager),
     }
 
