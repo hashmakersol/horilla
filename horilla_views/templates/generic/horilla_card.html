@@ -12,10 +12,14 @@
         hx-get="{{request.path}}?{{filter.urlencode}}"
         hx-target="#{{view_id|safe}}" hx-swap="outerHTML"
         >
-        <button class="oh-hover-btn" style="
+        <button
+        hx-get="{% url "last-applied-filter" %}?{{filter.urlencode}}"
+        hx-swap="none"
+        class="oh-hover-btn" style="
         cursor: pointer;
         border: solid 2px {{filter.color}};
         color: {{filter.color}} !important;
+        border-radius:30px;
         ">
           {{filter.title}}
         </button>
@@ -168,10 +172,10 @@
   </div>
   <script>
     var tabId = $("#{{view_id}}").closest(".oh-tabs__content").attr("id");
-    let badge = $(`#badge-${tabId}`);
-    let count = "{{queryset.paginator.count}}";
-    let label = badge.attr("data-badge-label") || "";
-    let title = count + " " + label;
+    var badge = $(`#badge-${tabId}`);
+    var count = "{{queryset.paginator.count}}";
+    var label = badge.attr("data-badge-label") || "";
+    var title = count + " " + label;
     badge.html(count);
     badge.attr("title", title);
   </script>

@@ -12,8 +12,9 @@ provide the main entry points for interacting with the application's functionali
 """
 
 import logging
+import uuid
 
-from horilla.horilla_settings import HORILLA_DATE_FORMATS
+from horilla.horilla_settings import DYNAMIC_URL_PATTERNS, HORILLA_DATE_FORMATS
 from horilla.methods import remove_dynamic_url
 
 logger = logging.getLogger(__name__)
@@ -37,6 +38,7 @@ from django.shortcuts import redirect, render
 from django.template.loader import render_to_string
 from django.urls import reverse
 from django.utils import timezone as django_timezone
+from django.utils.timezone import now
 from django.utils.translation import gettext as __
 from django.utils.translation import gettext_lazy as _
 from django.views.decorators.http import require_http_methods
@@ -73,6 +75,7 @@ from attendance.methods.utils import (
     monthly_leave_days,
     paginator_qry,
     parse_date,
+    parse_datetime,
     parse_time,
     sort_activity_dicts,
     strtime_seconds,
@@ -256,6 +259,8 @@ def attendance_excel(_request):
         return HttpResponse(exception)
 
 
+@login_required
+@permission_required("attendance.add_attendance")
 def attendance_import(request):
     """
     Save the import of attendance data from an uploaded Excel file, validate the data,
@@ -332,8 +337,15 @@ def attendance_view(request):
     attendances = Attendance.objects.filter(
         attendance_validated=True, employee_id__is_active=True
     )
+    # ot_attendances = Attendance.objects.filter(
+    #     overtime_second__gte=minot,
+    #     attendance_validated=True,
+    #     employee_id__is_active=True,
+    # )
+    # for attendance in ot_attendances:
+    #     attendance.min_ot_achieved = True
     ot_attendances = Attendance.objects.filter(
-        overtime_second__gte=minot,
+        overtime_second__gt=0,
         attendance_validated=True,
         employee_id__is_active=True,
     )
@@ -878,17 +890,22 @@ def process_activity_dicts(activity_dicts):
     from attendance.views.clock_in_out import clock_in, clock_out
 
     if not activity_dicts:
-        return
+        return []
+
     sorted_activity_dicts = sort_activity_dicts(activity_dicts)
+    error_dicts = []  # List to store dictionaries with errors
+
     for activity in sorted_activity_dicts:
         badge_id = activity.get("Badge ID")
         if not badge_id:
             activity["Error 1"] = "Please add the Badge ID column in the Excel sheet."
+            error_dicts.append(activity)
             continue
 
         employee = Employee.objects.filter(badge_id=badge_id).first()
         if not employee:
             activity["Error 2"] = "Invalid Badge ID"
+            error_dicts.append(activity)
             continue
 
         check_in_date = parse_date(activity["In Date"], "Error 4", activity)
@@ -903,37 +920,70 @@ def process_activity_dicts(activity_dicts):
             if not pd.isna(activity["Check Out"])
             else None
         )
-        if not any(key.startswith("Error") for key in activity.keys()):
-            if check_in_time:
-                try:
-                    clock_in(
-                        Request(
-                            user=employee.employee_user_id,
-                            date=check_in_date,
-                            time=check_in_time,
-                            datetime=django_timezone.make_aware(
-                                datetime.combine(check_in_date, check_in_time)
-                            ),
-                        )
-                    )
-                except Exception as e:
-                    logger.error(f"Got an error in import clock in {e}")
 
-            if check_out_time and check_out_date:
-                try:
-                    clock_out(
-                        Request(
-                            user=employee.employee_user_id,
-                            date=check_out_date,
-                            time=check_out_time,
-                            datetime=django_timezone.make_aware(
-                                datetime.combine(check_out_date, check_out_time)
-                            ),
-                        )
+        if any(key.startswith("Error") for key in activity.keys()):
+            error_dicts.append(activity)
+            continue
+
+        if check_in_time:
+            try:
+                clock_in(
+                    Request(
+                        user=employee.employee_user_id,
+                        date=check_in_date,
+                        time=check_in_time,
+                        datetime=django_timezone.make_aware(
+                            datetime.combine(check_in_date, check_in_time)
+                        ),
                     )
-                except Exception as e:
-                    logger.error(f"Got an error in import clock out {e}")
-    return activity_dicts
+                )
+            except Exception as e:
+                activity["Error 6"] = f"Got an error in import clock in {e}"
+                error_dicts.append(activity)
+
+        if check_out_time and check_out_date:
+            try:
+                clock_out(
+                    Request(
+                        user=employee.employee_user_id,
+                        date=check_out_date,
+                        time=check_out_time,
+                        datetime=django_timezone.make_aware(
+                            datetime.combine(check_out_date, check_out_time)
+                        ),
+                    )
+                )
+            except Exception as e:
+                activity["Error 7"] = f"Got an error in import clock out {e}"
+                error_dicts.append(activity)
+
+    return error_dicts
+
+
+def handle_activity_import_error(error_data):
+
+    # Directly create the DataFrame from the list of dictionaries
+    data_frame = pd.DataFrame(error_data)
+
+    # Create an HTTP response with an Excel attachment
+    response = HttpResponse(content_type="application/ms-excel")
+    response["Content-Disposition"] = 'attachment; filename="ImportError.xlsx"'
+    data_frame.to_excel(response, index=False)
+
+    def get_activity_error_sheet(request):
+        remove_dynamic_url(path_info)
+        return response
+
+    from attendance.urls import path, urlpatterns
+
+    # Create a unique path for the error file download
+    path_info = f"activity-error-sheet-{uuid.uuid4()}"
+    urlpatterns.append(path(path_info, get_activity_error_sheet, name=path_info))
+    DYNAMIC_URL_PATTERNS.append(path_info)
+
+    # Return the path information
+    path_info = f"attendance/{path_info}"
+    return path_info
 
 
 @login_required
@@ -944,9 +994,18 @@ def attendance_activity_import(request):
         data_frame = pd.read_excel(file)
         activity_dicts = data_frame.to_dict("records")
         if activity_dicts:
-            activity_dicts = process_activity_dicts(activity_dicts)
+            import_error_dicts = process_activity_dicts(activity_dicts)
+            path_info = handle_activity_import_error(import_error_dicts)
+            created_activity_count = len(activity_dicts) - len(import_error_dicts)
+            context = {
+                "created_count": created_activity_count,
+                "error_count": len(import_error_dicts),
+                "model": _("Attendance Activity"),
+                "path_info": path_info,
+            }
+            html = render_to_string("import_popup.html", context)
             messages.success(request, _("Attendance activity imported successfully"))
-            return redirect(attendance_activity_view)
+            return HttpResponse(html)
     return render(request, "attendance/attendance_activity/import_activity.html")
 
 
@@ -1188,27 +1247,6 @@ def validation_condition_create(request):
 
 @login_required
 @permission_required("attendance.change_attendancevalidationcondition")
-def validation_condition_update(request, obj_id):
-    """
-    This method is used to update validation condition
-    Args:
-        obj_id : validation condition instance id
-    """
-    condition = AttendanceValidationCondition.objects.get(id=obj_id)
-    form = AttendanceValidationConditionForm(instance=condition)
-    if request.method == "POST":
-        form = AttendanceValidationConditionForm(request.POST, instance=condition)
-        if form.is_valid():
-            form.save()
-    return render(
-        request,
-        "attendance/break_point/condition.html",
-        {"form": form, "condition": condition},
-    )
-
-
-@login_required
-@permission_required("attendance.change_attendancevalidationcondition")
 @require_http_methods(["POST"])
 def validation_condition_delete(request, obj_id):
     """
@@ -1231,24 +1269,30 @@ def validation_condition_delete(request, obj_id):
 @manager_can_enter("attendance.change_attendance")
 def validate_bulk_attendance(request):
     """
-    This method is used to validate bulk of attendances
+    This method is used to validate a bulk of attendances.
     """
-    ids = request.POST["ids"]
-    ids = json.loads(ids)
+    ids = json.loads(request.POST["ids"])
+    validate_req_count = 0
+    success_messages = []
+    error_messages = []
+
     for obj_id in ids:
         try:
             attendance = Attendance.objects.get(id=obj_id)
-            if not attendance.is_validate_request:
-                attendance.attendance_validated = True
-                attendance.save()
-                messages.success(request, _("Attendance validated."))
-            else:
-                messages.info(
-                    request,
+
+            if attendance.is_validate_request:
+                error_messages.append(
                     _(
                         "Pending attendance update request for {}'s attendance on {}!"
-                    ).format(attendance.employee_id, attendance.attendance_date),
+                    ).format(attendance.employee_id, attendance.attendance_date)
                 )
+                continue
+
+            attendance.attendance_validated = True
+            attendance.save()
+            validate_req_count += 1
+
+            # Send notification
             notify.send(
                 request.user.employee_get,
                 recipient=attendance.employee_id.employee_user_id,
@@ -1260,8 +1304,23 @@ def validate_bulk_attendance(request):
                 redirect=reverse("view-my-attendance") + f"?id={attendance.id}",
                 icon="checkmark",
             )
-        except (Attendance.DoesNotExist, OverflowError, ValueError):
-            messages.error(request, _("Attendance not found"))
+
+        except Attendance.DoesNotExist:
+            error_messages.append(_("Attendance not found"))
+        except (OverflowError, ValueError):
+            error_messages.append(_("Invalid attendance ID"))
+
+    # Handle messages
+    if validate_req_count > 0:
+        messages.success(
+            request, _("{} Attendances validated.").format(validate_req_count)
+        )
+    for msg in success_messages + error_messages:
+        if "Pending" in msg:
+            messages.info(request, msg)
+        else:
+            messages.error(request, msg)
+
     return JsonResponse({"message": "success"})
 
 
@@ -1504,6 +1563,50 @@ def update_fields_based_shift(request):
 
 
 @login_required
+@hx_request_required
+def update_worked_hour_field(request):
+    """
+    Update the worked hour field based on clock-in and clock-out times.
+
+    This view function calculates the total worked hours for an employee
+    by parsing the clock-in and clock-out dates and times from the request
+    parameters. It computes the duration between the two times and formats
+    the result as a string in the "HH:MM" format. The computed worked hours
+    are then initialized in an AttendanceForm, which is rendered in the
+    specified HTML template.
+    """
+    clock_in = parse_datetime(
+        (
+            now().strftime("%Y-%m-%d")
+            if request.GET.get("create_bulk")
+            else request.GET.get("attendance_clock_in_date")
+        ),
+        request.GET.get("attendance_clock_in"),
+    )
+    clock_out = parse_datetime(
+        (
+            now().strftime("%Y-%m-%d")
+            if request.GET.get("create_bulk")
+            else request.GET.get("attendance_clock_out_date")
+        ),
+        request.GET.get("attendance_clock_out"),
+    )
+
+    total_seconds = (
+        (clock_out - clock_in).total_seconds() if clock_in and clock_out else -1
+    )
+    hours, minutes = divmod(max(total_seconds, 0), 3600)
+    worked_hours_str = f"{int(hours):02}:{int(minutes // 60):02}"
+
+    form = AttendanceForm(initial={"attendance_worked_hour": worked_hours_str})
+    return render(
+        request,
+        "attendance/attendance/update_hx_form.html",
+        {"request": request, "form": form},
+    )
+
+
+@login_required
 def form_date_checking(request):
     attendance_date_str = request.POST["attendance_date"]
     minimum_hour = "00:00"
@@ -1568,6 +1671,17 @@ def user_request_one_view(request, id):
             "instance_ids_json": instance_ids_json,
             "dashboard": request.GET.get("dashboard"),
         },
+    )
+
+
+@login_required
+@hx_request_required
+def get_attendance_activities(request, obj_id):
+    attendance = Attendance.find(obj_id)
+    return render(
+        request,
+        "attendance/attendance/attendance_activites_view.html",
+        context={"attendance": attendance},
     )
 
 

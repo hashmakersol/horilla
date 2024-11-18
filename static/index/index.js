@@ -30,14 +30,15 @@ function getCookie(name) {
     return cookieValue;
 }
 
-function addToSelectedId(newIds) {
+function addToSelectedId(newIds, storeKey) {
+
     ids = JSON.parse(
-        $("#selectedInstances").attr("data-ids") || "[]"
+        $(`#${storeKey}`).attr("data-ids") || "[]"
     );
 
     ids = [...ids, ...newIds.map(String)]
     ids = Array.from(new Set(ids));
-    $("#selectedInstances").attr("data-ids", JSON.stringify(ids))
+    $(`#${storeKey}`).attr("data-ids", JSON.stringify(ids))
 }
 
 function attendanceDateChange(selectElement) {
@@ -86,20 +87,21 @@ function getAssignedLeave(employeeElement) {
         }
     });
 }
+function selectSelected(viewId, storeKey = "selectedInstances") {
 
-function selectSelected(viewId) {
     ids = JSON.parse(
-        $("#selectedInstances").attr("data-ids") || "[]"
+        $(`#${storeKey}`).attr("data-ids") || "[]"
     );
     $.each(ids, function (indexInArray, valueOfElement) {
         $(`${viewId} .oh-sticky-table__tbody .list-table-row[value=${valueOfElement}]`).prop("checked", true).change()
+        $(`${viewId} tbody .list-table-row[value=${valueOfElement}]`).prop("checked", true).change()
     });
-    $(`${viewId} .oh-sticky-table__tbody .list-table-row`).change(function (
+    $(`${viewId} .oh-sticky-table__tbody .list-table-row,${viewId} tbody .list-table-row`,).change(function (
         e
     ) {
         id = $(this).val()
         ids = JSON.parse(
-            $("#selectedInstances").attr("data-ids") || "[]"
+            $(`#${storeKey}`).attr("data-ids") || "[]"
         );
         ids = Array.from(new Set(ids));
         let index = ids.indexOf(id);
@@ -110,10 +112,12 @@ function selectSelected(viewId) {
                 ids.splice(index, 1);
             }
         }
-        $("#selectedInstances").attr("data-ids", JSON.stringify(ids));
+        $(`#${storeKey}`).attr("data-ids", JSON.stringify(ids));
     }
     );
-    reloadSelectedCount($('#count_{{view_id|safe}}'));
+    if (viewId) {
+        reloadSelectedCount($(`#count_${viewId}`), storeKey);
+    }
 
 }
 
@@ -171,8 +175,8 @@ function toggleReimbursmentType(element) {
     }
 }
 
-function reloadSelectedCount(targetElement) {
-    count = JSON.parse($("#selectedInstances").attr("data-ids") || "[]").length
+function reloadSelectedCount(targetElement, storeKey = "selectedInstances") {
+    var count = JSON.parse($(`#${storeKey}`).attr("data-ids") || "[]").length
     id = targetElement.attr("id")
     if (id) {
         id = id.split("count_")[1]
@@ -198,19 +202,18 @@ function removeHighlight() {
     }, 200);
 }
 
-function removeId(element) {
+function removeId(element, storeKey = "selectedInstances") {
     id = element.val();
     viewId = element.attr("data-view-id")
-    ids = JSON.parse($("#selectedInstances").attr("data-ids") || "[]")
+    ids = JSON.parse($(`#${storeKey}`).attr("data-ids") || "[]")
     let elementToRemove = 5;
     if (ids[ids.length - 1] === id) {
         ids.pop();
     }
     ids = JSON.stringify(ids)
-    $("#selectedInstances").attr("data-ids", ids);
+    $(`#${storeKey}`).attr("data-ids", ids);
 
 }
-
 function bulkStageUpdate(canIds, stageId, preStageId) {
     $.ajax({
         type: "POST",
@@ -295,22 +298,32 @@ function checkSequence(element) {
     }
 }
 
+function reloadMessage(e) {
+    $('#reloadMessagesButton').click();
+}
+
+function ajaxWithResponseHandler(event) {
+    $(event.target).each(function () {
+        $.each(this.attributes, function () {
+            if (this.specified && this.name === 'hx-on-htmx-after-request') {
+                eval(this.value);
+            }
+        });
+    });
+}
+
 var originalConfirm = window.confirm;
 // Override the default confirm function with SweetAlert
 window.confirm = function (message) {
     var event = window.event || {};
     event.preventDefault();
-    var languageCode = null;
-    languageCode = $("#main-section-data").attr("data-lang");
-    var confirm =
-        confirmModal[languageCode] ||
-        ((languageCode = "en"), confirmModal[languageCode]);
-    var cancel =
-        cancelModal[languageCode] ||
-        ((languageCode = "en"), cancelModal[languageCode]);
-    // Add event listener to "Confirm" button
+    var languageCode = $("#main-section-data").attr("data-lang") || "en";
+    var confirm = confirmModal[languageCode];
+    var cancel = cancelModal[languageCode];
+
     $("#confirmModalBody").html(message);
     var submit = false;
+
     Swal.fire({
         text: message,
         icon: "question",
@@ -321,15 +334,30 @@ window.confirm = function (message) {
         cancelButtonText: cancel,
     }).then((result) => {
         if (result.isConfirmed) {
+            var path = event.target["htmx-internal-data"]?.path;
+            var verb = event.target["htmx-internal-data"]?.verb;
+            var hxTarget = $(event.target).attr("hx-target");
+            var hxVals = $(event.target).attr("hx-vals") ? JSON.parse($(event.target).attr("hx-vals")) : {};
+            var hxSwap = $(event.target).attr("hx-swap");
+            $(event.target).each(function () {
+                $.each(this.attributes, function () {
+                    if (this.specified && this.name === 'hx-on-htmx-before-request') {
+                        eval(this.value);
+
+                    }
+                });
+            });
             if (event.target.tagName.toLowerCase() === "form") {
-                if (event.target["htmx-internal-data"]) {
-                    var path = event.target["htmx-internal-data"].path;
-                    var verb = event.target["htmx-internal-data"].verb;
-                    var hxTarget = $(event.target).attr("hx-target");
+                if (path && verb) {
                     if (verb === "post") {
-                        htmx.ajax("POST", path, hxTarget);
+                        htmx.ajax("POST", path, { target: hxTarget, swap: hxSwap, values: hxVals })
+                            .then(response => {
+                                ajaxWithResponseHandler(event);
+                            });
                     } else {
-                        htmx.ajax("GET", path, hxTarget);
+                        htmx.ajax("GET", path, { target: hxTarget, swap: hxSwap, values: hxVals }).then(response => {
+                            ajaxWithResponseHandler(event);
+                        });
                     }
                 } else {
                     event.target.submit();
@@ -338,27 +366,27 @@ window.confirm = function (message) {
                 if (event.target.href) {
                     window.location.href = event.target.href;
                 } else {
-                    var path = event.target["htmx-internal-data"].path;
-                    var verb = event.target["htmx-internal-data"].verb;
-                    var hxTarget = $(event.target).attr("hx-target");
                     if (verb === "post") {
-                        // hx.post(path)
-                        htmx.ajax("POST", path, hxTarget);
+                        htmx.ajax("POST", path, { target: hxTarget, swap: hxSwap, values: hxVals }).then(response => {
+                            ajaxWithResponseHandler(event);
+                        });
                     } else {
-                        htmx.ajax("GET", path, hxTarget);
+                        htmx.ajax("GET", path, { target: hxTarget, swap: hxSwap, values: hxVals }).then(response => {
+                            ajaxWithResponseHandler(event);
+                        });
                     }
                 }
             } else {
-                var path = event.target["htmx-internal-data"].path;
-                var verb = event.target["htmx-internal-data"].verb;
-                var hxTarget = $(event.target).attr("hx-target");
                 if (verb === "post") {
-                    htmx.ajax("POST", path, hxTarget);
+                    htmx.ajax("POST", path, { target: hxTarget, swap: hxSwap, values: hxVals }).then(response => {
+                        ajaxWithResponseHandler(event);
+                    });
                 } else {
-                    htmx.ajax("GET", path, hxTarget);
+                    htmx.ajax("GET", path, { target: hxTarget, swap: hxSwap, values: hxVals }).then(response => {
+                        ajaxWithResponseHandler(event);
+                    });
                 }
             }
-        } else {
         }
     });
 };
@@ -385,13 +413,22 @@ nav.after(
 );
 
 $(document).on("htmx:beforeRequest", function (event, data) {
-    var response = event.detail.xhr.response;
-    var target = $(event.detail.elt.getAttribute("hx-target"));
-    var avoid_target = ["BiometricDeviceTestFormTarget", "reloadMessages", "infinite"];
-    if (!target.closest("form").length && avoid_target.indexOf(target.attr("id")) === -1) {
-        target.html(`<div class="animated-background"></div>`);
+    if (!Array.from(event.target.getAttributeNames()).some(attr => attr.startsWith('hx-on'))) {
+        var response = event.detail.xhr.response;
+        var target = $(event.detail.elt.getAttribute("hx-target"));
+        var avoid_target = ["BiometricDeviceTestFormTarget", "reloadMessages", "infinite"];
+        if (!target.closest("form").length && avoid_target.indexOf(target.attr("id")) === -1) {
+            target.html(`<div class="animated-background"></div>`);
+        }
     }
 });
+function htmxLoadIndicator(e) {
+    var target = $(e).attr('hx-target');
+    $(target).find('th').empty();
+    $(target).find('th').addClass('skeleton');
+    $(target).find('td').empty();
+    $(target).find('td').addClass('skeleton');
+}
 
 $(document).on('keydown', function (event) {
     // Check if the cursor is not focused on an input field
@@ -458,4 +495,24 @@ function handleDownloadAndRefresh(event, url) {
         document.body.removeChild(iframe);  // Clean up the iframe
         window.location.reload();  // Refresh the page
     }, 500);  // Adjust the delay as needed
+}
+
+function toggleCommentButton(e) {
+    const $button = $(e).closest('form').find('#commentButton');
+    $button.toggle($(e).val().trim() !== '');
+}
+
+function updateUserPanelCount(e) {
+    var count = $(e).closest('.oh-sticky-table__tr').find('.oh-user-panel').length;
+    setTimeout(() => {
+        var $permissionCountSpan = $(e).closest('.oh-permission-table--toggle').parent().find('.oh-permission-count');
+        var currentText = $permissionCountSpan.text();
+
+        var firstSpaceIndex = currentText.indexOf(' ');
+        var textAfterNumber = currentText.slice(firstSpaceIndex + 1);
+        var newText = count + ' ' + textAfterNumber;
+
+        $permissionCountSpan.text(newText);
+
+    }, 100);
 }

@@ -219,7 +219,7 @@ class LeaveType(HorillaModel):
         """
         url = f"https://ui-avatars.com/api/?name={self.name}&background=random"
         if self.icon:
-            full_filename = settings.MEDIA_ROOT + self.icon.name
+            full_filename = self.icon.name
 
             if default_storage.exists(full_filename):
                 url = self.icon.url
@@ -693,11 +693,12 @@ class LeaveRequest(HorillaModel):
         conditions = None
         if work_info.exists():
             department_id = self.employee_id.employee_work_info.department_id
+            emp_comp_id = self.employee_id.employee_work_info.company_id
         requested_days = self.requested_days
         applicable_condition = False
-        if department_id != None:
+        if department_id != None and emp_comp_id != None:
             conditions = MultipleApprovalCondition.objects.filter(
-                department=department_id
+                department=department_id, company_id=emp_comp_id
             ).order_by("condition_value")
         if conditions != None:
             for condition in conditions:
@@ -742,7 +743,7 @@ class LeaveRequest(HorillaModel):
             if EmployeePastLeaveRestrict.objects.first().enabled:
                 if self.start_date < date.today():
                     raise ValidationError(_("Requests cannot be made for past dates."))
-        if request.user.is_superuser:
+        if not request.user.is_superuser:
 
             for restrict in restricted_leave:
                 restri = restrict.id
@@ -1075,6 +1076,14 @@ class RestrictLeave(HorillaModel):
     description = models.TextField(
         null=True, verbose_name=_("Description"), max_length=255
     )
+    company_id = models.ForeignKey(
+        Company,
+        null=True,
+        blank=True,
+        on_delete=models.CASCADE,
+        verbose_name=_("Company"),
+    )
+    objects = HorillaCompanyManager(related_company_field="company_id")
 
     def __str__(self) -> str:
         return f"{self.title}"

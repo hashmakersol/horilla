@@ -17,6 +17,7 @@ from django.db.models import ProtectedError, Q
 from django.http import HttpResponse, JsonResponse
 from django.shortcuts import get_object_or_404, redirect, render
 from django.urls import reverse
+from django.utils.encoding import force_str
 from django.utils.translation import gettext as __
 from django.utils.translation import gettext_lazy as _
 from django.views.decorators.http import require_http_methods
@@ -30,6 +31,7 @@ from base.methods import (
     filtersubordinates,
     get_key_instances,
     get_pagination,
+    is_reportingmanager,
     sortby,
 )
 from base.models import CompanyLeaves, Holidays, PenaltyAccounts
@@ -1506,18 +1508,17 @@ def leave_assign_bulk_delete(request):
     """
     ids = request.POST["ids"]
     ids = json.loads(ids)
+    count = 0
     for assigned_leave_id in ids:
         try:
             assigned_leave = AvailableLeave.objects.get(id=assigned_leave_id)
-            leave_type = assigned_leave.leave_type_id
-            employee = assigned_leave.employee_id
             assigned_leave.delete()
-            messages.success(
-                request,
-                _("{} assigned to {} deleted.".format(leave_type, employee)),
-            )
+            count += 1
         except Exception as e:
             messages.error(request, _("Assigned leave not found."))
+    messages.success(
+        request, _("{} assigned leaves deleted successfully ").format(count)
+    )
     return JsonResponse({"message": "Success"})
 
 
@@ -1548,7 +1549,7 @@ def assign_leave_type_excel(_request):
 @manager_can_enter("leave.add_availableleave")
 def assign_leave_type_import(request):
     """
-    This function accepts a POST request containing an Excel file with assign leave type to employee data.
+    This function accepts a POST request containing an Excel file with assigned leave type to employee data.
     It processes the data, checks for errors, and either assigns leave types to employees
     or generates an error report in the form of an Excel file.
     """
@@ -1560,56 +1561,73 @@ def assign_leave_type_import(request):
         "Assigned Error": [],
         "Other Errors": [],
     }
-    error_list = []
-    file_name = "AssignLeaveError.xlsx"
+
     if request.method == "POST":
         file = request.FILES["assign_leave_type_import"]
         data_frame = pd.read_excel(file)
         assign_leave_dicts = data_frame.to_dict("records")
-        for assign_leave in assign_leave_dicts:
-            try:
-                save = True
-                assign_leave_type = assign_leave["Leave Type"]
-                badge_id = assign_leave["Employee Badge ID"]
-                employee = Employee.objects.filter(badge_id__iexact=badge_id).first()
-                leave_type = LeaveType.objects.filter(
-                    name__iexact=assign_leave_type
-                ).first()
-                if employee is None:
-                    save = False
-                    assign_leave["Badge ID Error"] = _("This badge id does not exist.")
 
-                if leave_type is None:
-                    save = False
-                    assign_leave["Leave Type Error"] = _(
-                        "This leave type does not exist."
-                    )
-                if AvailableLeave.objects.filter(
-                    leave_type_id=leave_type, employee_id=employee
-                ).exists():
-                    save = False
-                    assign_leave["Assigned Error"] = _(
-                        "Leave type has already been assigned to the employee."
-                    )
-                if save:
-                    AvailableLeave(
-                        leave_type_id=leave_type,
-                        employee_id=employee,
-                        available_days=leave_type.total_days,
-                    ).save()
-                else:
-                    error_list.append(assign_leave)
-            except Exception as exception:
-                assign_leave["Other Errors"] = f"{str(exception)}"
+        # Pre-fetch all employees and leave types
+        employees = {emp.badge_id.lower(): emp for emp in Employee.objects.all()}
+        leave_types = {lt.name.lower(): lt for lt in LeaveType.objects.all()}
+        available_leaves = {
+            (al.leave_type.id, al.employee.id): al
+            for al in AvailableLeave.objects.all()
+        }
+
+        assign_leave_list = []
+        error_list = []
+
+        for assign_leave in assign_leave_dicts:
+            badge_id = assign_leave.get("Employee Badge ID", "").strip().lower()
+            assign_leave_type = assign_leave.get("Leave Type", "").strip().lower()
+            employee = employees.get(badge_id)
+            leave_type = leave_types.get(assign_leave_type)
+
+            errors = []
+            if employee is None:
+                errors.append(_("This badge id does not exist."))
+            if leave_type is None:
+                errors.append(_("This leave type does not exist."))
+            if errors:
+                assign_leave[
+                    "Badge ID Error" if "badge id" in errors[0] else "Leave Type Error"
+                ] = " ".join(force_str(error) for error in errors)
                 error_list.append(assign_leave)
+                continue
+
+            # Check if leave type has already been assigned to the employee
+            if (leave_type.id, employee.id) in available_leaves:
+                assign_leave["Assigned Error"] = _(
+                    "Leave type has already been assigned to the employee."
+                )
+                error_list.append(assign_leave)
+                continue
+
+            # If no errors, create the AvailableLeave instance
+            assign_leave_list.append(
+                AvailableLeave(
+                    leave_type_id=leave_type,
+                    employee_id=employee,
+                    available_days=leave_type.total_days,
+                )
+            )
+
+        # Bulk create available leaves
+        if assign_leave_list:
+            AvailableLeave.objects.bulk_create(assign_leave_list)
+
+        # Generate error report if there are errors
         path_info = None
         if error_list:
-            path_info = generate_error_report(error_list, error_data, file_name)
-        assigned_leave_count = len(assign_leave_dicts) - len(error_list)
+            path_info = generate_error_report(
+                error_list, error_data, "AssignLeaveError.xlsx"
+            )
+
         context = {
-            "created_count": assigned_leave_count,
+            "created_count": len(assign_leave_dicts) - len(error_list),
             "error_count": len(error_list),
-            "model": _("Assined Leaves"),
+            "model": _("Assigned Leaves"),
             "path_info": path_info,
         }
         html = render_to_string("import_popup.html", context)
@@ -1997,7 +2015,10 @@ def user_leave_request(request, id):
                                 icon="people-circle",
                                 redirect=f"/leave/request-view?id={leave_request.id}",
                             )
-
+                    mail_thread = LeaveMailSendThread(
+                        request, leave_request, type="request"
+                    )
+                    mail_thread.start()
                     messages.success(request, _("Leave request created successfully.."))
                     with contextlib.suppress(Exception):
                         notify.send(
@@ -4098,13 +4119,22 @@ def delete_allocationrequest_comment(request, comment_id):
     """
     This method is used to delete Allocation request comments
     """
-    comment = LeaveallocationrequestComment.objects.filter(id=comment_id)
-    if not request.user.has_perm("leave.delete_leaveallocationrequestcomment"):
-        comment.filter(employee_id__employee_user_id=request.user)
-    request_id = comment.first().request_id.id
-    comment.delete()
-    messages.success(request, _("Comment deleted successfully!"))
-    return redirect("allocation-request-view-comment", leave_id=request_id)
+    script = ""
+    comment = LeaveallocationrequestComment.find(comment_id)
+    request_id = comment.request_id.id
+    if (
+        request.user.employee_get == comment.employee_id
+        or request.user.has_perm("leave.delete_leaveallocationrequestcomment")
+        or is_reportingmanager(request)
+    ):
+        comment.delete()
+        messages.success(request, _("Comment deleted successfully!"))
+    else:
+        script = f"""
+                    <span hx-get="/leave/allocation-request-view-comment/{request_id}/" hx-target="#commentContainer" hx-trigger="load"></span>
+                """
+        messages.warning(request, _("You don't have permission"))
+    return HttpResponse(script)
 
 
 @login_required
@@ -4112,26 +4142,24 @@ def delete_allocation_comment_file(request):
     """
     Used to delete attachment
     """
+    script = ""
     ids = request.GET.getlist("ids")
-    if request.user.has_perm("leave.delete_leaverequestfile"):
-        LeaverequestFile.objects.filter(id__in=ids).delete()
-    else:
-        LeaverequestFile.objects.filter(
-            id__in=ids, employee_id__employee_user_id=request.user
-        ).delete()
-
     leave_id = request.GET["leave_id"]
-    comments = LeaveallocationrequestComment.objects.filter(
-        request_id=leave_id
-    ).order_by("-created_at")
-    return render(
-        request,
-        "leave/leave_allocation_request/leave_allocation_comment.html",
-        {
-            "comments": comments,
-            "request_id": leave_id,
-        },
-    )
+    comment_id = request.GET["comment_id"]
+    comment = LeaveallocationrequestComment.find(comment_id)
+    if (
+        request.user.employee_get == comment.employee_id
+        or request.user.has_perm("leave.delete_leaverequestfile")
+        or is_reportingmanager(request)
+    ):
+        LeaverequestFile.objects.filter(id__in=ids).delete()
+        messages.success(request, _("File deleted successfully"))
+    else:
+        messages.warning(request, _("You don't have permission"))
+        script = f"""
+                <span hx-get='/leave/allocation-request-view-comment/{leave_id}/' hx-target='#commentContainer' hx-trigger='load'></span>
+                """
+    return HttpResponse(script)
 
 
 @login_required
@@ -4231,35 +4259,46 @@ def delete_leaverequest_comment(request, comment_id):
     """
     This method is used to delete Leave request comments
     """
-    comment = LeaverequestComment.objects.filter(id=comment_id)
-    if not request.user.has_perm("leave.delete_leaverequestcomment"):
-        comment = comment.filter(employee_id__employee_user_id=request.user)
-    redirect_url = "leave-request-view-comment"
-    leave_id = comment.first().request_id.id
-    comment.delete()
-    messages.success(request, _("Comment deleted successfully!"))
-    return redirect(redirect_url, leave_id)
+    script = ""
+    comment = LeaverequestComment.find(comment_id)
+    if (
+        request.user.employee_get == comment.employee_id
+        or request.user.has_perm("leave.delete_leaverequestcomment")
+        or is_reportingmanager(request)
+    ):
+        comment.delete()
+        messages.success(request, _("Comment deleted successfully!"))
+    else:
+        messages.warning(request, _("You don't have permission"))
+        script = f"""
+            <span hx-get="/leave/leave-request-view-comment/{comment.request_id.id}/?&amp;target=leaveRequest" hx-target="#commentContainer" hx-trigger="load"></span>
+        """
+    return HttpResponse(script)
 
 
 @login_required
-def delete_comment_file(request):
+def delete_leave_comment_file(request):
     """
     Used to delete attachment
     """
+    script = ""
     ids = request.GET.getlist("ids")
-    LeaverequestFile.objects.filter(id__in=ids).delete()
-    comments = LeaverequestComment.objects.all()
     leave_id = request.GET["leave_id"]
-    comments = comments.filter(request_id=leave_id).order_by("-created_at")
-    template = "leave/leave_request/leave_comment.html"
-    return render(
-        request,
-        template,
-        {
-            "comments": comments,
-            "request_id": leave_id,
-        },
-    )
+    comment_id = request.GET["comment_id"]
+    comment = LeaverequestComment.find(comment_id)
+    if (
+        request.user.employee_get == comment.employee_id
+        or request.user.has_perm("leave.delete_leaverequestfile")
+        or is_reportingmanager(request)
+    ):
+        LeaverequestFile.objects.filter(id__in=ids).delete()
+        messages.success(request, _("File deleted successfully"))
+    else:
+        messages.warning(request, _("You don't have permission"))
+        script = f"""
+            <span hx-get="/leave/leave-request-view-comment/{leave_id}/?&amp;target=leaveRequest" hx-target="#commentContainer" hx-trigger="load"></span>
+        """
+    return HttpResponse(script)
 
 
 if apps.is_installed("attendance"):

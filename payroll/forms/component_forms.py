@@ -228,6 +228,9 @@ class DeductionForm(forms.ModelForm):
         )
         reload_queryset(self.fields)
         self.fields["style"].widget = widget.StyleWidget(form=self)
+        for field_name, field in self.fields.items():
+            if isinstance(field.widget, forms.Select):
+                field.widget.option_template_name = "horilla_widgets/select_option.html"
 
     def clean(self, *args, **kwargs):
         cleaned_data = super().clean(*args, **kwargs)
@@ -349,6 +352,14 @@ class PayslipForm(ModelForm):
             for contract in active_contracts
             if contract.employee_id.is_active
         ]
+        self.fields["employee_id"].widget.attrs.update(
+            {
+                "hx-get": "/payroll/check-contract-start-date",
+                "hx-target": "#contractStartDateDiv",
+                "hx-include": "#payslipCreateForm",
+                "hx-trigger": "change delay:300ms",
+            }
+        )
         if self.instance.pk is None:
             self.initial["start_date"] = datetime.date.today().replace(day=1)
             self.initial["end_date"] = datetime.date.today()
@@ -369,6 +380,10 @@ class PayslipForm(ModelForm):
             "start_date": forms.DateInput(
                 attrs={
                     "type": "date",
+                    "hx-get": "/payroll/check-contract-start-date",
+                    "hx-target": "#contractStartDateDiv",
+                    "hx-include": "#payslipCreateForm",
+                    "hx-trigger": "change delay:300ms",
                 }
             ),
             "end_date": forms.DateInput(
@@ -386,7 +401,7 @@ class GeneratePayslipForm(HorillaForm):
 
     group_name = forms.CharField(
         label="Batch name",
-        required=False,
+        required=True,
         # help_text="Enter +-something if you want to generate payslips by batches",
     )
     employee_id = HorillaMultiSelectField(
@@ -398,6 +413,7 @@ class GeneratePayslipForm(HorillaForm):
             filter_template_path="employee_filters.html",
         ),
         label="Employee",
+        required=True,
     )
     start_date = forms.DateField(widget=forms.DateInput(attrs={"type": "date"}))
     end_date = forms.DateField(widget=forms.DateInput(attrs={"type": "date"}))

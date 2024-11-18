@@ -1057,10 +1057,11 @@ def delete_stage_note_file(request, id):
     Args:
         id : stage file instance id
     """
+    script = ""
     file = StageFiles.objects.get(id=id)
-    cand_id = file.stagenote_set.all().first().candidate_id.id
     file.delete()
-    return redirect("view-note", cand_id=cand_id)
+    messages.success(request, _("File deleted successfully"))
+    return HttpResponse(script)
 
 
 @login_required
@@ -1071,11 +1072,12 @@ def delete_individual_note_file(request, id):
     Args:
         id : stage file instance id
     """
+    script = ""
     file = StageFiles.objects.get(id=id)
     cand_id = file.stagenote_set.all().first().candidate_id.id
     file.delete()
     messages.success(request, _("File deleted successfully"))
-    return redirect(f"/recruitment/add-note/{cand_id}/")
+    return HttpResponse(script)
 
 
 @login_required
@@ -1272,6 +1274,7 @@ def candidate(request):
         if form.is_valid():
             candidate_obj = form.save(commit=False)
             candidate_obj.start_onboard = False
+            candidate_obj.source = "software"
             if candidate_obj.stage_id is None:
                 candidate_obj.stage_id = Stage.objects.filter(
                     recruitment_id=candidate_obj.recruitment_id, stage_type="initial"

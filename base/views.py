@@ -4,7 +4,9 @@ views.py
 This module is used to map url pattens with django views or methods
 """
 
+import csv
 import json
+import os
 import uuid
 from datetime import datetime, timedelta
 from email.mime.image import MIMEImage
@@ -19,6 +21,7 @@ from django.contrib import messages
 from django.contrib.auth import authenticate, login, logout
 from django.contrib.auth.models import Group, Permission, User
 from django.contrib.auth.views import PasswordResetConfirmView, PasswordResetView
+from django.core.files.base import ContentFile
 from django.core.mail import EmailMultiAlternatives
 from django.core.management import call_command
 from django.core.paginator import Paginator
@@ -103,8 +106,10 @@ from base.methods import (
     export_data,
     filtersubordinates,
     filtersubordinatesemployeemodel,
+    format_date,
     get_key_instances,
     get_pagination,
+    is_reportingmanager,
     sortby,
 )
 from base.models import (
@@ -143,7 +148,12 @@ from base.models import (
 )
 from employee.filters import EmployeeFilter
 from employee.forms import ActiontypeForm
-from employee.models import Actiontype, Employee, EmployeeWorkInformation
+from employee.models import (
+    Actiontype,
+    DisciplinaryAction,
+    Employee,
+    EmployeeWorkInformation,
+)
 from horilla.decorators import (
     delete_permission,
     duplicate_permission,
@@ -153,7 +163,11 @@ from horilla.decorators import (
     permission_required,
 )
 from horilla.group_by import group_by_queryset
-from horilla.horilla_settings import DB_INIT_PASSWORD, DYNAMIC_URL_PATTERNS
+from horilla.horilla_settings import (
+    DB_INIT_PASSWORD,
+    DYNAMIC_URL_PATTERNS,
+    FILE_STORAGE,
+)
 from horilla.methods import get_horilla_model_class, remove_dynamic_url
 from horilla_audit.forms import HistoryTrackingFieldsForm
 from horilla_audit.models import AccountBlockUnblock, AuditTag, HistoryTrackingFields
@@ -230,6 +244,8 @@ def load_demo_database(request):
                     "leave": "leave_data.json",
                     "asset": "asset_data.json",
                     "recruitment": "recruitment_data.json",
+                    "onboarding": "onboarding_data.json",
+                    "offboarding": "offboarding_data.json",
                     "pms": "pms_data.json",
                     "payroll": "payroll_data.json",
                 }
@@ -765,20 +781,6 @@ def home(request):
     """
     This method is used to render index page
     """
-    if len(EmployeeShiftDay.objects.all()) == 0:
-        days = (
-            ("monday", "Monday"),
-            ("tuesday", "Tuesday"),
-            ("wednesday", "Wednesday"),
-            ("thursday", "Thursday"),
-            ("friday", "Friday"),
-            ("saturday", "Saturday"),
-            ("sunday", "Sunday"),
-        )
-        for day in days:
-            shift_day = EmployeeShiftDay()
-            shift_day.day = day[0]
-            shift_day.save()
 
     today = datetime.today()
     today_weekday = today.weekday()
@@ -878,9 +880,9 @@ def employee_workinfo_complete(request):
             for field_name in fields_to_focus
             if getattr(employee, field_name) is not None
         )
-        if completed_field_count < 14:
+        if completed_field_count < 15:
             # Create a dictionary with employee information and pending field count
-            percent = f"{((completed_field_count / 14) * 100):.1f}"
+            percent = f"{((completed_field_count / 15) * 100):.1f}"
             employee_info = {
                 "employee": employee,
                 "completed_field_count": percent,
@@ -1216,6 +1218,7 @@ def object_delete(request, obj_id, **kwargs):
     """
     model = kwargs.get("model")
     redirect_path = kwargs.get("redirect_path")
+    delete_error = False
     try:
         instance = model.objects.get(id=obj_id)
         instance.delete()
@@ -1223,6 +1226,7 @@ def object_delete(request, obj_id, **kwargs):
             request, _("The {} has been deleted successfully.").format(instance)
         )
     except model.DoesNotExist:
+        delete_error = True
         messages.error(request, _("{} not found.").format(model._meta.verbose_name))
     except ProtectedError as e:
         model_verbose_names_set = set()
@@ -1230,6 +1234,7 @@ def object_delete(request, obj_id, **kwargs):
             model_verbose_names_set.add(_(obj._meta.verbose_name.capitalize()))
 
         model_names_str = ", ".join(model_verbose_names_set)
+        delete_error = True
         messages.error(
             request,
             _("This {} is already in use for {}.").format(instance, model_names_str),
@@ -1249,6 +1254,14 @@ def object_delete(request, obj_id, **kwargs):
         previous_data = request.GET.urlencode()
         redirect_path = redirect_path + "?" + previous_data
         return redirect(redirect_path)
+    elif kwargs.get("HttpResponse"):
+        if delete_error:
+            return_part = "<script>window.location.reload()</script>"
+        elif kwargs.get("HttpResponse") is True:
+            return_part = ""
+        else:
+            return_part = kwargs.get("HttpResponse")
+        return HttpResponse(f"{return_part}")
     else:
         return HttpResponseRedirect(request.META.get("HTTP_REFERER", "/"))
 
@@ -3278,13 +3291,16 @@ def work_type_request_view(request):
     """
     previous_data = request.GET.urlencode()
     employee = Employee.objects.filter(employee_user_id=request.user).first()
-    work_type_requests = filtersubordinates(
-        request, WorkTypeRequest.objects.all(), "base.add_worktyperequest"
-    )
-    work_type_requests = work_type_requests | WorkTypeRequest.objects.filter(
-        employee_id=employee
-    )
-    work_type_requests = work_type_requests.filter(employee_id__is_active=True)
+    if request.user.has_perm("base.view_worktyperequest"):
+        work_type_requests = WorkTypeRequest.objects.all()
+    else:
+        work_type_requests = filtersubordinates(
+            request, WorkTypeRequest.objects.all(), "base.add_worktyperequest"
+        )
+        work_type_requests = work_type_requests | WorkTypeRequest.objects.filter(
+            employee_id=employee
+        )
+        work_type_requests = work_type_requests.filter(employee_id__is_active=True)
     requests_ids = json.dumps(
         [
             instance.id
@@ -3349,7 +3365,11 @@ def work_type_request_search(request):
     previous_data = request.GET.urlencode()
     field = request.GET.get("field")
     f = WorkTypeRequestFilter(request.GET)
-    work_typ_requests = filtersubordinates(request, f.qs, "base.add_worktyperequest")
+    work_typ_requests = (
+        filtersubordinates(request, f.qs, "base.add_worktyperequest")
+        if not request.user.has_perm("base.view_worktyperequest")
+        else f.qs
+    )
     employee_work_requests = list(WorkTypeRequest.objects.filter(employee_id=employee))
     subordinates_work_requests = list(work_typ_requests)
     combined_requests = list(set(subordinates_work_requests + employee_work_requests))
@@ -3984,7 +4004,7 @@ def shift_request_view(request):
     shift_requests = filtersubordinates(
         request,
         ShiftRequest.objects.filter(reallocate_to__isnull=True),
-        "base.add_shiftrequest",
+        "base.view_shiftrequest",
     )
     shift_requests = shift_requests | ShiftRequest.objects.filter(employee_id=employee)
     shift_requests = shift_requests.filter(employee_id__is_active=True)
@@ -3992,7 +4012,7 @@ def shift_request_view(request):
     allocated_shift_requests = filtersubordinates(
         request,
         ShiftRequest.objects.filter(reallocate_to__isnull=False),
-        "base.add_shiftrequest",
+        "base.view_shiftrequest",
     )
     allocated_requests = ShiftRequest.objects.filter(reallocate_to__isnull=False)
     if not request.user.has_perm("base.view_shiftrequest"):
@@ -4797,22 +4817,25 @@ def delete_notification(request, id):
     """
     This method is used to delete notification
     """
+    script = ""
     try:
         request.user.notifications.get(id=id).delete()
         messages.success(request, _("Notification deleted."))
     except Exception as e:
         messages.error(request, e)
-    notifications = request.user.notifications.all()
-    return render(
-        request, "notification/all_notifications.html", {"notifications": notifications}
-    )
+    if not request.user.notifications.all():
+        script = """<span hx-get='/all-notifications' hx-target='#allNotificationBody' hx-trigger='load'></span>"""
+    return HttpResponse(script)
 
 
 @login_required
 def mark_as_read_notification(request, notification_id):
+    script = ""
     notification = Notification.objects.get(id=notification_id)
     notification.mark_as_read()
-    return redirect(notifications)
+    if not request.user.notifications.unread():
+        script = """<span hx-get='/notifications' hx-target='#notificationContainer' hx-trigger='load'></span>"""
+    return HttpResponse(script)
 
 
 @login_required
@@ -4955,10 +4978,15 @@ def save_date_format(request):
                 company_name = Company.objects.filter(company=employee_company)
                 emp_company = company_name.first()
 
-                # Save the selected format to the backend
-                emp_company.date_format = selected_format
-                emp_company.save()
-                messages.success(request, _("Date format saved successfully."))
+                if emp_company is None:
+                    messages.warning(
+                        request, _("Please update the company field for the user.")
+                    )
+                else:
+                    # Save the selected format to the backend
+                    emp_company.date_format = selected_format
+                    emp_company.save()
+                    messages.success(request, _("Date format saved successfully."))
             else:
                 messages.warning(
                     request, _("Date format cannot saved. You are not in the company.")
@@ -5017,10 +5045,15 @@ def save_time_format(request):
                 company_name = Company.objects.filter(company=employee_company)
                 emp_company = company_name.first()
 
-                # Save the selected format to the backend
-                emp_company.time_format = selected_format
-                emp_company.save()
-                messages.success(request, _("Time format saved successfully."))
+                if emp_company is None:
+                    messages.warning(
+                        request, _("Please update the company field for the user.")
+                    )
+                else:
+                    # Save the selected format to the backend
+                    emp_company.time_format = selected_format
+                    emp_company.save()
+                    messages.success(request, _("Time format saved successfully."))
             else:
                 messages.warning(
                     request, _("Time format cannot saved. You are not in the company.")
@@ -5397,7 +5430,15 @@ def audit_tag_update(request, tag_id):
 @permission_required("base.view_multipleapprovalcondition")
 def multiple_approval_condition(request):
     form = MultipleApproveConditionForm()
-    conditions = MultipleApprovalCondition.objects.all().order_by("department")[::-1]
+    selected_company = request.session.get("selected_company")
+    if selected_company != "all":
+        conditions = MultipleApprovalCondition.objects.filter(
+            company_id=selected_company
+        ).order_by("department")[::-1]
+    else:
+        conditions = MultipleApprovalCondition.objects.all().order_by("department")[
+            ::-1
+        ]
     create = True
     return render(
         request,
@@ -5410,7 +5451,15 @@ def multiple_approval_condition(request):
 @hx_request_required
 @permission_required("base.view_multipleapprovalcondition")
 def hx_multiple_approval_condition(request):
-    conditions = MultipleApprovalCondition.objects.all().order_by("department")[::-1]
+    selected_company = request.session.get("selected_company")
+    if selected_company != "all":
+        conditions = MultipleApprovalCondition.objects.filter(
+            company_id=selected_company
+        ).order_by("department")[::-1]
+    else:
+        conditions = MultipleApprovalCondition.objects.all().order_by("department")[
+            ::-1
+        ]
     return render(
         request,
         "multi_approval_condition/condition_table.html",
@@ -5499,7 +5548,9 @@ def multiple_level_approval_create(request):
         condition_value = request.POST.get("condition_value")
         condition_start_value = request.POST.get("condition_start_value")
         condition_end_value = request.POST.get("condition_end_value")
+        company_id = request.POST.get("company_id")
         condition_approval_managers = request.POST.getlist("multi_approval_manager")
+        company = Company.objects.get(id=company_id)
         department = Department.objects.get(id=dept_id)
         instance = MultipleApprovalCondition()
         if form.is_valid():
@@ -5508,12 +5559,14 @@ def multiple_level_approval_create(request):
                 instance.condition_field = condition_field
                 instance.condition_operator = condition_operator
                 instance.condition_value = condition_value
+                instance.company_id = company
             else:
                 instance.department = department
                 instance.condition_field = condition_field
                 instance.condition_operator = condition_operator
                 instance.condition_start_value = condition_start_value
                 instance.condition_end_value = condition_end_value
+                instance.company_id = company
             instance.save()
             sequence = 0
             for emp_id in condition_approval_managers:
@@ -5580,7 +5633,16 @@ def multiple_level_approval_edit(request, condition_id):
                         sequence=sequence,
                         employee_id=employee_id,
                     )
-    conditions = MultipleApprovalCondition.objects.all().order_by("department")[::-1]
+    selected_company = request.session.get("selected_company")
+    if selected_company != "all":
+        conditions = MultipleApprovalCondition.objects.filter(
+            company_id=selected_company
+        ).order_by("department")[::-1]
+    else:
+        conditions = MultipleApprovalCondition.objects.all().order_by("department")[
+            ::-1
+        ]
+
     return render(
         request,
         "multi_approval_condition/condition_edit_form.html",
@@ -5706,12 +5768,13 @@ def create_shiftrequest_comment(request, shift_id):
                     "comments": comments,
                     "no_comments": no_comments,
                     "request_id": shift_id,
+                    "shift_request": shift,
                 },
             )
     return render(
         request,
         "shift_request/htmx/shift_comment.html",
-        {"form": form, "request_id": shift_id},
+        {"form": form, "request_id": shift_id, "shift_request": shift},
     )
 
 
@@ -5721,6 +5784,7 @@ def view_shift_comment(request, shift_id):
     """
     This method is used to render all the notes of the employee
     """
+    shift_request = ShiftRequest.find(shift_id)
     comments = ShiftRequestComment.objects.filter(request_id=shift_id).order_by(
         "-created_at"
     )
@@ -5745,31 +5809,33 @@ def view_shift_comment(request, shift_id):
             "comments": comments,
             "no_comments": no_comments,
             "request_id": shift_id,
+            "shift_request": shift_request,
         },
     )
 
 
 @login_required
-@permission_required("offboarding.delete_offboardingnote")
+@hx_request_required
 def delete_shift_comment_file(request):
     """
     Used to delete attachment
     """
     ids = request.GET.getlist("ids")
-    BaserequestFile.objects.filter(id__in=ids).delete()
-    messages.success(request, _("File deleted successfully"))
     shift_id = request.GET["shift_id"]
-    comments = ShiftRequestComment.objects.filter(request_id=shift_id).order_by(
-        "-created_at"
-    )
-    return render(
-        request,
-        "shift_request/htmx/shift_comment.html",
-        {
-            "comments": comments,
-            "request_id": shift_id,
-        },
-    )
+    comment_id = request.GET["comment_id"]
+    comment = ShiftRequestComment.find(comment_id)
+    script = ""
+    if (
+        request.user.employee_get == comment.employee_id
+        or request.user.has_perm("base.delete_baserequestfile")
+        or is_reportingmanager(request)
+    ):
+        BaserequestFile.objects.filter(id__in=ids).delete()
+        messages.success(request, _("File deleted successfully"))
+    else:
+        messages.warning(request, _("You don't have permission"))
+        script = f"""<span hx-get="/view-shift-comment/{shift_id}/" hx-trigger="load" hx-target="#commentContainer" data-target="#activitySidebar"></span>"""
+    return HttpResponse(script)
 
 
 @login_required
@@ -5778,6 +5844,7 @@ def view_work_type_comment(request, work_type_id):
     """
     This method is used to render all the notes of the employee
     """
+    work_type_request = WorkTypeRequest.find(work_type_id)
     comments = WorkTypeRequestComment.objects.filter(request_id=work_type_id).order_by(
         "-created_at"
     )
@@ -5802,29 +5869,33 @@ def view_work_type_comment(request, work_type_id):
             "comments": comments,
             "no_comments": no_comments,
             "request_id": work_type_id,
+            "work_type_request": work_type_request,
         },
     )
 
 
 @login_required
-@permission_required("offboarding.delete_offboardingnote")
+@hx_request_required
 def delete_work_type_comment_file(request):
     """
     Used to delete attachment
     """
     ids = request.GET.getlist("ids")
-    BaserequestFile.objects.filter(id__in=ids).delete()
-    messages.success(request, _("File deleted successfully"))
-    work_type_id = request.GET["work_type_id"]
-    comments = WorkTypeRequestComment.objects.filter(request_id=work_type_id)
-    return render(
-        request,
-        "work_type_request/htmx/work_type_comment.html",
-        {
-            "comments": comments,
-            "request_id": work_type_id,
-        },
-    )
+    request_id = request.GET["request_id"]
+    comment_id = request.GET["comment_id"]
+    comment = WorkTypeRequestComment.find(comment_id)
+    script = ""
+    if (
+        request.user.employee_get == comment.employee_id
+        or request.user.has_perm("base.delete_baserequestfile")
+        or is_reportingmanager(request)
+    ):
+        BaserequestFile.objects.filter(id__in=ids).delete()
+        messages.success(request, _("File deleted successfully"))
+    else:
+        messages.warning(request, _("You don't have permission"))
+        script = f"""<span hx-get="/view-work-type-comment/{request_id}/" hx-trigger="load" hx-target="#commentContainer" data-target="#activitySidebar"></span>"""
+    return HttpResponse(script)
 
 
 @login_required
@@ -5833,13 +5904,20 @@ def delete_shiftrequest_comment(request, comment_id):
     """
     This method is used to delete shift request comments
     """
-    comment = ShiftRequestComment.objects.filter(id=comment_id)
-    if not request.user.has_perm("base.delete_shiftrequestcomment"):
-        comment = comment.filter(employee_id__employee_user_id=request.user)
-    shift_id = comment.first().request_id.id
-    comment.delete()
-    messages.success(request, _("Comment deleted successfully!"))
-    return redirect("view-shift-comment", shift_id=shift_id)
+    comment = ShiftRequestComment.find(comment_id)
+    request_id = comment.request_id.id
+    script = ""
+    if (
+        request.user.employee_get == comment.employee_id
+        or request.user.has_perm("base.delete_baserequestfile")
+        or is_reportingmanager(request)
+    ):
+        comment.delete()
+        messages.success(request, _("Comment deleted successfully!"))
+    else:
+        messages.warning(request, _("You don't have permission"))
+        script = f"""<span hx-get="/view-shift-comment/{request_id}/" hx-trigger="load" hx-target="#commentContainer" data-target="#activitySidebar"></span>"""
+    return HttpResponse(script)
 
 
 @login_required
@@ -5950,12 +6028,13 @@ def create_worktyperequest_comment(request, worktype_id):
                     "comments": comments,
                     "no_comments": no_comments,
                     "request_id": worktype_id,
+                    "work_type_request": work_type,
                 },
             )
     return render(
         request,
         "work_type_request/htmx/work_type_comment.html",
-        {"form": form, "request_id": worktype_id},
+        {"form": form, "request_id": worktype_id, "work_type_request": work_type},
     )
 
 
@@ -5965,13 +6044,20 @@ def delete_worktyperequest_comment(request, comment_id):
     """
     This method is used to delete Work type request comments
     """
-    comment = WorkTypeRequestComment.objects.filter(id=comment_id)
-    if not request.user.has_perm("base.delete_worktyperequestcomment"):
-        comment = comment.filter(employee_id__employee_user_id=request.user)
-    worktype_id = comment.first().request_id.id
-    comment.delete()
-    messages.success(request, _("Comment deleted successfully!"))
-    return redirect("view-work-type-comment", work_type_id=worktype_id)
+    script = ""
+    comment = WorkTypeRequestComment.find(comment_id)
+    request_id = comment.request_id.id
+    if (
+        request.user.employee_get == comment.employee_id
+        or request.user.has_perm("base.delete_baserequestfile")
+        or is_reportingmanager(request)
+    ):
+        comment.delete()
+        messages.success(request, _("Comment deleted successfully!"))
+    else:
+        messages.warning(request, _("You don't have permission"))
+        script = f"""<span hx-get="/view-work-type-comment/{request_id}/" hx-trigger="load" hx-target="#commentContainer" data-target="#activitySidebar"></span>"""
+    return HttpResponse(script)
 
 
 @login_required
@@ -5997,7 +6083,7 @@ def pagination_settings_view(request):
 
 
 @login_required
-@permission_required("base.view_actiontype")
+@permission_required("employee.view_actiontype")
 def action_type_view(request):
     """
     This method is used to show Action Type
@@ -6010,7 +6096,7 @@ def action_type_view(request):
 
 @login_required
 @hx_request_required
-@permission_required("base.add_actiontype")
+@permission_required("employee.add_actiontype")
 def action_type_create(request):
     """
     This method renders form and template to create Action Type
@@ -6024,9 +6110,7 @@ def action_type_create(request):
             form.save()
             form = ActiontypeForm()
             messages.success(request, _("Action has been created successfully!"))
-            if dynamic == "None":
-                return HttpResponse("<script>window.location.reload()</script>")
-            else:
+            if dynamic != "None":
                 url = reverse("create-actions")
                 instance = Actiontype.objects.all().order_by("-id").first()
                 mutable_get = request.GET.copy()
@@ -6046,7 +6130,7 @@ def action_type_create(request):
 
 @login_required
 @hx_request_required
-@permission_required("base.change_actiontype")
+@permission_required("employee.change_actiontype")
 def action_type_update(request, act_id):
     """
     This method renders form and template to update Action type
@@ -6055,7 +6139,10 @@ def action_type_update(request, act_id):
     form = ActiontypeForm(instance=action)
 
     if action.action_type == "warning":
-        if AccountBlockUnblock.objects.first().is_enabled:
+        if (
+            AccountBlockUnblock.objects.first()
+            and AccountBlockUnblock.objects.first().is_enabled
+        ):
             form.fields["block_option"].widget = forms.HiddenInput()
 
     if request.method == "POST":
@@ -6067,7 +6154,6 @@ def action_type_update(request, act_id):
             form.save()
             form = ActiontypeForm()
             messages.success(request, _("Action has been updated successfully!"))
-            return HttpResponse("<script>window.location.reload()</script>")
     return render(
         request,
         "base/action_type/action_type_form.html",
@@ -6082,11 +6168,20 @@ def action_type_delete(request, act_id):
     """
     This method is used to delete the action type.
     """
-    Actiontype.objects.filter(id=act_id).delete()
-    message = _("Action has been deleted successfully!")
-    return HttpResponse(
-        f"<div class='oh-wrapper'> <div class='oh-alert-container'> <div class='oh-alert oh-alert--animated oh-alert--success'>{message}</div></div></div>"
-    )
+    if DisciplinaryAction.objects.filter(action=act_id).exists():
+
+        messages.error(
+            request,
+            _(
+                "This action type is in use in disciplinary actions and cannot be deleted."
+            ),
+        )
+        return HttpResponse("<script>window.location.reload()</script>")
+
+    else:
+        Actiontype.objects.filter(id=act_id).delete()
+        messages.success(request, _("Action has been deleted successfully!"))
+        return HttpResponse()
 
 
 @login_required
@@ -6405,11 +6500,158 @@ def holidays_excel_template(request):
         return HttpResponse(exception)
 
 
+def csv_holiday_import(file):
+    """
+    Imports holiday data from a CSV file.
+
+    This function reads a CSV file containing holiday information, validates the data,
+    and saves valid holiday records to the database using bulk creation for efficiency.
+
+    The expected format for the CSV file is:
+    - "Holiday Name": Name of the holiday (string)
+    - "Start Date": Start date of the holiday (date string in a recognized format)
+    - "End Date": End date of the holiday (date string in a recognized format)
+    - "Recurring": Indicates whether the holiday recurs ("yes" or "no")
+    """
+    holiday_list, error_list = [], []
+    file_name = FILE_STORAGE.save("holiday_import.csv", ContentFile(file.read()))
+    holiday_file = FILE_STORAGE.path(file_name)
+
+    with open(holiday_file, errors="ignore") as csv_file:
+        save = True
+        reader = csv.reader(csv_file)
+        next(reader)
+
+        for total_rows, row in enumerate(reader, start=1):
+            try:
+                name, start_date, end_date, recurring = row
+                holiday_dict = {
+                    "Holiday Name": name,
+                    "Start Date": start_date,
+                    "End Date": end_date,
+                    "Recurring": recurring,
+                }
+
+                try:
+                    start_date = format_date(start_date)
+                except:
+                    save = False
+                    holiday_dict["Start Date Error"] = _("Invalid start date format.")
+                    error_list.append(holiday_dict)
+
+                try:
+                    end_date = format_date(end_date)
+                except:
+                    save = False
+                    holiday_dict["End Date Error"] = _("Invalid end date format.")
+                    error_list.append(holiday_dict)
+
+                if recurring.lower() not in ["yes", "no"]:
+                    save = False
+                    holiday_dict["Recurring Field Error"] = _(
+                        "Recurring must be yes or no."
+                    )
+                    error_list.append(holiday_dict)
+
+                if save:
+                    holiday_list.append(
+                        Holidays(
+                            name=name,
+                            start_date=start_date,
+                            end_date=end_date,
+                            recurring=recurring.lower() == "yes",
+                        )
+                    )
+
+            except Exception as e:
+                holiday_dict["Other Errors"] = str(e)
+                error_list.append(holiday_dict)
+
+    if holiday_list:
+        Holidays.objects.bulk_create(holiday_list)
+
+    if os.path.exists(holiday_file):
+        os.remove(holiday_file)
+
+    return (error_list, total_rows)
+
+
+def excel_holiday_import(file):
+    """
+    Imports holiday data from an Excel file.
+
+    This function reads an Excel file containing holiday information, validates the data,
+    and saves valid holiday records to the database using bulk creation for efficiency
+
+    The expected format for the Excel file is:
+    - "Holiday Name": Name of the holiday (string)
+    - "Start Date": Start date of the holiday (date string in a recognized format)
+    - "End Date": End date of the holiday (date string in a recognized format)
+    - "Recurring": Indicates whether the holiday recurs ("yes" or "no")
+
+    """
+    error_list = []
+    valid_holidays = []
+    data_frame = pd.read_excel(file)
+    holiday_dicts = data_frame.to_dict("records")
+
+    for holiday in holiday_dicts:
+        save = True
+        try:
+            name = holiday["Holiday Name"]
+
+            try:
+                start_date = pd.to_datetime(holiday["Start Date"]).date()
+            except Exception:
+                save = False
+                holiday["Start Date Error"] = _("Invalid start date format {}").format(
+                    holiday["Start Date"]
+                )
+
+            try:
+                end_date = pd.to_datetime(holiday["End Date"]).date()
+            except Exception:
+                save = False
+                holiday["End Date Error"] = _("Invalid end date format {}").format(
+                    holiday["End Date"]
+                )
+
+            recurring_str = holiday.get("Recurring", "").lower()
+            if recurring_str in ["yes", "no"]:
+                recurring = recurring_str == "yes"
+            else:
+                save = False
+                holiday["Recurring Field Error"] = _(
+                    "Recurring must be {} or {}"
+                ).format("yes", "no")
+
+            if save:
+                holiday_instance = Holidays(
+                    name=name,
+                    start_date=start_date,
+                    end_date=end_date,
+                    recurring=recurring,
+                )
+                valid_holidays.append(holiday_instance)
+            else:
+                error_list.append(holiday)
+
+        except Exception as e:
+            holiday["Other errors"] = str(e)
+            error_list.append(holiday)
+
+    if valid_holidays:
+        Holidays.objects.bulk_create(valid_holidays)
+
+    return error_list, len(holiday_dicts)
+
+
 @login_required
 @permission_required("base.add_holiday")
 def holidays_info_import(request):
+    result = None
     file_name = "HolidaysImportError.xlsx"
-    error_list = []
+    path_info = None
     error_data = {
         "Holiday Name": [],
         "Start Date": [],
@@ -6417,64 +6659,41 @@ def holidays_info_import(request):
         "Recurring": [],
         "Start Date Error": [],
         "End Date Error": [],
-        "Reccuring Field Error": [],
-        "Other errors": [],
+        "Recurring Field Error": [],
+        "Other Errors": [],
     }
 
     if request.method == "POST":
-        file = request.FILES["holidays_import"]
-        data_frame = pd.read_excel(file)
-        holiday_dicts = data_frame.to_dict("records")
-        for holiday in holiday_dicts:
-            save = True
-            try:
-                name = holiday["Holiday Name"]
-                try:
-                    start_date = pd.to_datetime(holiday["Start Date"]).date()
-                except Exception as e:
-                    save = False
-                    holiday["Start Date Error"] = _(
-                        "Invalid start date format {}"
-                    ).format(holiday["Start Date"])
-                try:
-                    end_date = pd.to_datetime(holiday["End Date"]).date()
-                except Exception as e:
-                    save = False
-                    holiday["End Date Error"] = _("Invalid end date format {}").format(
-                        holiday["End Date"]
-                    )
-                if holiday["Recurring"].lower() in ["yes", "no"]:
-                    recurring = True if holiday["Recurring"].lower() == "yes" else False
-                else:
-                    save = False
-                    holiday["Reccuring Field Error"] = _(
-                        "Recurring must be {} or {}"
-                    ).format("yes", "no")
-                if save:
-                    holiday = Holidays(
-                        name=name,
-                        start_date=start_date,
-                        end_date=end_date,
-                        recurring=recurring,
-                    )
-                    holiday.save()
-                else:
-                    error_list.append(holiday)
-            except Exception as e:
-                holiday["Other errors"] = f"{str(e)}"
-                error_list.append(holiday)
-        path_info = None
-        if error_list:
-            path_info = generate_error_report(error_list, error_data, file_name)
-        created_holidays_count = len(holiday_dicts) - len(error_list)
-        context = {
-            "created_count": created_holidays_count,
-            "error_count": len(error_list),
-            "model": _("Holidays"),
-            "path_info": path_info,
-        }
-        html = render_to_string("import_popup.html", context)
-        return HttpResponse(html)
+        file = request.FILES.get("holidays_import")
+        if file:
+            content_type = file.content_type
+            if content_type == "text/csv":
+                error_list, total_count = csv_holiday_import(file)
+                if error_list:
+                    path_info = generate_error_report(error_list, error_data, file_name)
+            elif (
+                content_type
+                == "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            ):
+                error_list, total_count = excel_holiday_import(file)
+                if error_list:
+                    path_info = generate_error_report(error_list, error_data, file_name)
+            else:
+                messages.error(
+                    request, _("The file you attempted to import is unsupported")
+                )
+                return HttpResponse("<script>window.location.reload()</script>")
+
+            created_holidays_count = total_count - len(error_list)
+            context = {
+                "created_count": created_holidays_count,
+                "error_count": len(error_list),
+                "model": _("Holidays"),
+                "path_info": path_info,
+            }
+            result = render_to_string("import_popup.html", context)
+
+    return HttpResponse(result)
 
 
 @login_required
@@ -6621,8 +6840,7 @@ def bulk_holiday_delete(request):
     """
     This method is used to delete bulk of holidays
     """
-    ids = request.POST["ids"]
-    ids = json.loads(ids)
+    ids = request.POST.getlist("ids")
     del_ids = []
     for holiday_id in ids:
         try:
@@ -6634,7 +6852,7 @@ def bulk_holiday_delete(request):
     messages.success(
         request, _("{} Holidays have been successfully deleted.".format(len(del_ids)))
     )
-    return JsonResponse({"message": "Success"})
+    return redirect("holiday-filter")
 
 
 @login_required

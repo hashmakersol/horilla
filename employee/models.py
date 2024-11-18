@@ -198,8 +198,7 @@ class Employee(models.Model):
             f"https://ui-avatars.com/api/?name={self.get_full_name()}&background=random"
         )
         if self.employee_profile:
-            full_filename = settings.MEDIA_ROOT + self.employee_profile.name
-
+            full_filename = self.employee_profile.name
             if default_storage.exists(full_filename):
                 url = self.employee_profile.url
         return url
@@ -237,7 +236,25 @@ class Employee(models.Model):
         """
         if apps.is_installed("attendance"):
             today = datetime.today()
-            attendance = self.employee_attendances.filter(attendance_date=today).first()
+            yesterday = today - timedelta(days=1)
+            today_attendance = None
+            yesterday_attendance = None
+            attendances = list(
+                self.employee_attendances.filter(
+                    attendance_date__in=[yesterday, today]
+                ).order_by("attendance_date")
+            )
+
+            if len(attendances) == 1:
+                yesterday_attendance, today_attendance = attendances[0], None
+            elif len(attendances) == 2:
+                yesterday_attendance, today_attendance = attendances
+            else:
+                yesterday_attendance, today_attendance = None, None
+
+            attendance = today_attendance
+            if not today_attendance:
+                attendance = yesterday_attendance
             minimum_hour_seconds = strtime_seconds(
                 getattr(attendance, "minimum_hour", "0")
             )
@@ -252,6 +269,7 @@ class Employee(models.Model):
                 "forecasted_pending_hours": format_time(forecasted_pending_hours),
                 "forecasted_at_work_seconds": at_work,
                 "forecasted_pending_hours_seconds": forecasted_pending_hours,
+                "has_attendance": attendance is not None,
             }
         else:
             return {}
@@ -440,6 +458,17 @@ class Employee(models.Model):
             .order_by("-created_at")
             .first()
         )
+
+    def get_subordinate_employees(self):
+        """
+        Function to get all Employee objects of subordinates reporting to a given manager.
+        :param manager: Employee object who is the reporting manager.
+        :return: QuerySet of Employee objects.
+        """
+        subordinates = Employee.objects.filter(
+            employee_work_info__reporting_manager_id=self
+        )
+        return subordinates
 
     def save(self, *args, **kwargs):
         # your custom code here
@@ -734,7 +763,7 @@ class Policy(HorillaModel):
     attachments = models.ManyToManyField(PolicyMultipleFile, blank=True)
     company_id = models.ManyToManyField(Company, blank=True, verbose_name=_("Company"))
 
-    objects = HorillaCompanyManager()
+    objects = HorillaCompanyManager("company_id")
 
     def delete(self, *args, **kwargs):
         super().delete(*args, **kwargs)
@@ -824,6 +853,10 @@ class Actiontype(HorillaModel):
     def __str__(self) -> str:
         return f"{self.title}"
 
+    class Meta:
+        verbose_name = _("Action Type")
+        verbose_name_plural = _("Action Types")
+
 
 class DisciplinaryAction(HorillaModel):
     """
@@ -846,9 +879,7 @@ class DisciplinaryAction(HorillaModel):
     attachment = models.FileField(
         upload_to="employee/discipline", null=True, blank=True
     )
-    company_id = models.ManyToManyField(Company, blank=True)
-
-    objects = HorillaCompanyManager()
+    objects = HorillaCompanyManager("employee_id__employee_work_info__company_id")
 
     def __str__(self) -> str:
         return f"{self.action}"

@@ -3,12 +3,16 @@ asset.py
 
 This module is used to """
 
+import csv
 import json
+import os
 from datetime import date, datetime
 from urllib.parse import parse_qs
 
 import pandas as pd
 from django.contrib import messages
+from django.core.files.base import ContentFile
+from django.core.files.storage import FileSystemStorage
 from django.core.paginator import Paginator
 from django.db.models import ProtectedError
 from django.http import HttpResponse, HttpResponseRedirect, JsonResponse
@@ -106,7 +110,12 @@ def asset_creation(request, asset_category_id):
         None
     """
     initial_data = {"asset_category_id": asset_category_id}
-    form = AssetForm(initial=initial_data)
+    # Use request.GET to pre-fill the form with dynamic create batch number data if available
+    form = (
+        AssetForm(request.GET, initial=initial_data)
+        if request.GET.get("csrfmiddlewaretoken")
+        else AssetForm(initial=initial_data)
+    )
     if request.method == "POST":
         form = AssetForm(request.POST, initial=initial_data)
         if form.is_valid():
@@ -159,7 +168,7 @@ def add_asset_report(request, asset_id=None):
 
 @login_required
 @hx_request_required
-@permission_required("asset.delete_asset")
+@permission_required("asset.change_asset")
 def asset_update(request, asset_id):
     """
     Updates an asset with the given ID.
@@ -344,27 +353,7 @@ def asset_list(request, cat_id):
     """
     context = {}
     asset_under = ""
-    assets_in_category = Asset.objects.none()
-    asset_info = request.GET.get("asset_info")
-    asset_list_filter = request.GET.get("asset_list")
-    if asset_list_filter:
-        # if the data is present means that it is for asset filtered list
-        query = request.GET.get("query")
-        asset_under = "asset_filter"
-        if query:
-            assets_in_category = Asset.objects.filter(asset_name__icontains=query)
-        else:
-            assets_in_category = Asset.objects.all()
-    elif asset_info:
-        pass
-    else:
-        # if the data is not present means that it is for asset category list
-        asset_under = "asset_category"
-        asset_category = AssetCategory.objects.get(id=cat_id)
-        assets_in_category = Asset.objects.filter(asset_category_id=asset_category)
-
-    previous_data = request.GET.urlencode()
-    asset_filtered = AssetFilter(request.GET, queryset=assets_in_category)
+    asset_filtered = AssetFilter(request.GET)
     asset_list = asset_filtered.qs
 
     paginator = Paginator(asset_list, get_pagination())
@@ -372,6 +361,7 @@ def asset_list(request, cat_id):
     page_obj = paginator.get_page(page_number)
 
     requests_ids = json.dumps([instance.id for instance in page_obj.object_list])
+    previous_data = request.GET.urlencode()
     data_dict = parse_qs(previous_data)
     get_key_instances(Asset, data_dict)
     context = {
@@ -379,7 +369,7 @@ def asset_list(request, cat_id):
         "pg": previous_data,
         "asset_category_id": cat_id,
         "asset_under": asset_under,
-        "asset_count": len(assets_in_category) or None,
+        "asset_count": len(asset_list) or None,
         "filter_dict": data_dict,
         "requests_ids": requests_ids,
     }
@@ -458,32 +448,43 @@ def delete_asset_category(request, cat_id):
 
 def filter_pagination_asset_category(request):
     """
-    This view is used for pagination
+    This view is used for pagination and filtering asset categories
     """
-    search = request.GET.get("search")
-    if search is None:
-        search = ""
+    search = request.GET.get("search", "")
 
     previous_data = request.GET.urlencode()
-    asset_category_queryset = AssetCategory.objects.all().filter(
-        asset_category_name__icontains=search
-    )
-    asset_category_filtered = AssetCategoryFilter(
-        request.GET, queryset=asset_category_queryset
-    )
-    asset_category_paginator = Paginator(asset_category_filtered.qs, get_pagination())
+
+    asset_category_queryset = AssetCategory.objects.all()
+
+    if request.GET:
+        asset_category_filtered = AssetCategoryFilter(
+            request.GET, queryset=asset_category_queryset
+        )
+        asset_category_queryset = (
+            asset_category_filtered.qs
+        )  # Filter the queryset based on the GET params
+        asset_category_filtered_form = asset_category_filtered.form  # Show filter form
+    else:
+        asset_category_filtered_form = None
+
+    # Pagination
+    asset_category_paginator = Paginator(asset_category_queryset, get_pagination())
     page_number = request.GET.get("page")
     asset_categories = asset_category_paginator.get_page(page_number)
+
     data_dict = parse_qs(previous_data)
     get_key_instances(AssetCategory, data_dict)
+
     asset_creation_form = AssetForm()
+    if data_dict.get("type"):
+        del data_dict["type"]
     asset_category_form = AssetCategoryForm()
     asset_filter_form = AssetFilter()
     return {
         "asset_creation_form": asset_creation_form,
         "asset_category_form": asset_category_form,
         "asset_categories": asset_categories,
-        "asset_category_filter_form": asset_category_filtered.form,
+        "asset_category_filter_form": asset_category_filtered_form,
         "asset_filter_form": asset_filter_form.form,
         "pg": previous_data,
         "filter_dict": data_dict,
@@ -528,12 +529,6 @@ def asset_category_view_search_filter(request):
     Raises:
         None
     """
-
-    search_type = request.GET.get("type")
-    query = request.GET.get("search")
-    if search_type == "asset":
-        # searching asset will redirect to asset list and pass the query
-        return redirect(f"/asset/asset-list/0?asset_list=asset&query={query}")
     context = filter_pagination_asset_category(request)
     return render(request, "category/asset_category.html", context)
 
@@ -566,7 +561,7 @@ def asset_request_creation(request):
 
 
 @login_required
-@manager_can_enter(perm="asset.add_asset")
+@permission_required(perm="asset.add_assetassignment")
 def asset_request_approve(request, req_id):
     """
     Approves an asset request with the given ID and updates the corresponding asset record
@@ -622,7 +617,7 @@ def asset_request_approve(request, req_id):
 
 
 @login_required
-@manager_can_enter(perm="asset.add_asset")
+@permission_required(perm="asset.add_assetassignment")
 def asset_request_reject(request, req_id):
     """
     View function to reject an asset request.
@@ -657,7 +652,7 @@ def asset_request_reject(request, req_id):
 
 
 @login_required
-@permission_required(perm="asset.add_asset")
+@permission_required(perm="asset.add_assetassignment")
 def asset_allocate_creation(request):
     """
     View function to create asset allocation.
@@ -731,6 +726,7 @@ def asset_allocate_return_request(request, asset_id):
 
 
 @login_required
+@permission_required(perm="asset.change_assetassignment")
 def asset_allocate_return(request, asset_id):
     """
     View function to return asset.
@@ -960,6 +956,7 @@ def asset_request_alloaction_view_search_filter(request):
 
 
 @login_required
+@hx_request_required
 def own_asset_individual_view(request, asset_id):
     """
     This function is responsible for view the individual own asset
@@ -985,6 +982,7 @@ def own_asset_individual_view(request, asset_id):
 
 
 @login_required
+@hx_request_required
 def asset_request_individual_view(request, asset_request_id):
     """
     Display the details of an individual asset request.
@@ -1016,6 +1014,7 @@ def asset_request_individual_view(request, asset_request_id):
 
 
 @login_required
+@hx_request_required
 def asset_allocation_individual_view(request, asset_allocation_id):
     """
     Display the details of an individual asset allocation.
@@ -1053,6 +1052,85 @@ def convert_nan(val):
     return val
 
 
+fs = FileSystemStorage(location="csv_tmp/")
+
+
+def csv_asset_import(file):
+    file_content = ContentFile(file.read())
+    file_name = fs.save("_tmp.csv", file_content)
+    tmp_file = fs.path(file_name)
+
+    with open(tmp_file, errors="ignore") as csv_file:
+        reader = csv.reader(csv_file)
+        next(reader)  # Skip header row
+
+        asset_list = []
+        for row in reader:
+            (
+                asset_name,
+                asset_description,
+                asset_tracking_id,
+                asset_purchase_date,
+                asset_purchase_cost,
+                asset_category_name,
+                asset_status,
+                asset_lot_number,
+            ) = row
+
+            # Helper function to get or create categories and lots
+            asset_category, _ = AssetCategory.objects.get_or_create(
+                asset_category_name=asset_category_name
+            )
+            asset_lot, _ = AssetLot.objects.get_or_create(lot_number=asset_lot_number)
+
+            asset_list.append(
+                Asset(
+                    asset_name=asset_name,
+                    asset_description=asset_description,
+                    asset_tracking_id=asset_tracking_id,
+                    asset_purchase_date=asset_purchase_date,
+                    asset_purchase_cost=asset_purchase_cost,
+                    asset_status=asset_status,
+                    asset_category_id=asset_category,
+                    asset_lot_number_id=asset_lot,
+                )
+            )
+
+    # Bulk create assets from CSV
+    Asset.objects.bulk_create(asset_list)
+
+    # Delete the temporary file
+    if os.path.exists(tmp_file):
+        os.remove(tmp_file)
+
+
+def spreadsheetml_asset_import(dataframe):
+    for index, row in dataframe.iterrows():
+        asset_name = convert_nan(row["Asset name"])
+        asset_description = convert_nan(row["Description"])
+        asset_tracking_id = convert_nan(row["Tracking id"])
+        purchase_date = convert_nan(row["Purchase date"])
+        purchase_cost = convert_nan(row["Purchase cost"])
+        category_name = convert_nan(row["Category"])
+        lot_number = convert_nan(row["Batch number"])
+        status = convert_nan(row["Status"])
+
+        asset_category, create = AssetCategory.objects.get_or_create(
+            asset_category_name=category_name
+        )
+        asset_lot_number, create = AssetLot.objects.get_or_create(lot_number=lot_number)
+        Asset.objects.create(
+            asset_name=asset_name,
+            asset_description=asset_description,
+            asset_tracking_id=asset_tracking_id,
+            asset_purchase_date=purchase_date,
+            asset_purchase_cost=purchase_cost,
+            asset_category_id=asset_category,
+            asset_status=status,
+            asset_lot_number_id=asset_lot_number,
+        )
+
+
 @login_required
 @permission_required(perm="asset.add_asset")
 def asset_import(request):
@@ -1070,55 +1148,33 @@ def asset_import(request):
     Returns:
         HttpResponseRedirect: A redirect to the asset category view after processing the import.
     """
+    if request.META.get("HTTP_HX_REQUEST"):
+        return render(request, "asset/asset_import.html")
     try:
         if request.method == "POST":
             file = request.FILES.get("asset_import")
-
-            if file is not None:
+            if file is not None and file.content_type == "text/csv":
+                try:
+                    csv_asset_import(file)
+                    messages.success(request, _("Successfully imported Assets"))
+                except Exception as exception:
+                    messages.error(request, f"{exception}")
+            elif (
+                file is not None
+                and file.content_type
+                == "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            ):
                 try:
                     dataframe = pd.read_excel(file)
+                    spreadsheetml_asset_import(dataframe)
+                    messages.success(request, _("Successfully imported Assets"))
                 except KeyError as exception:
                     messages.error(request, f"{exception}")
-                    return redirect(asset_category_view)
-
-                # Create Asset objects from the DataFrame and save them to the database
-                for index, row in dataframe.iterrows():
-                    asset_name = convert_nan(row["Asset name"])
-                    asset_description = convert_nan(row["Description"])
-                    asset_tracking_id = convert_nan(row["Tracking id"])
-                    purchase_date = convert_nan(row["Purchase date"])
-                    purchase_cost = convert_nan(row["Purchase cost"])
-                    category_name = convert_nan(row["Category"])
-                    lot_number = convert_nan(row["Batch number"])
-                    status = convert_nan(row["Status"])
-
-                    asset_category, create = AssetCategory.objects.get_or_create(
-                        asset_category_name=category_name
-                    )
-                    asset_lot_number, create = AssetLot.objects.get_or_create(
-                        lot_number=lot_number
-                    )
-                    Asset.objects.create(
-                        asset_name=asset_name,
-                        asset_description=asset_description,
-                        asset_tracking_id=asset_tracking_id,
-                        asset_purchase_date=purchase_date,
-                        asset_purchase_cost=purchase_cost,
-                        asset_category_id=asset_category,
-                        asset_status=status,
-                        asset_lot_number_id=asset_lot_number,
-                    )
-
-                messages.success(request, _("Successfully imported Assets"))
             else:
                 messages.error(request, _("File Error"))
-
             return redirect(asset_category_view)
-
     except Exception as exception:
         messages.error(request, f"{exception}")
-        return redirect(asset_category_view)
-
     return redirect(asset_category_view)
 
 
@@ -1149,7 +1205,7 @@ def asset_excel(_request):
 
 
 @login_required
-@permission_required(perm="asset.add_asset")
+@permission_required("asset.view_assetcategory")
 def asset_export_excel(request):
     """asset export view"""
     asset_export_filter = AssetExportFilter(request.GET, queryset=Asset.objects.all())
@@ -1251,6 +1307,7 @@ def asset_export_excel(request):
 
 
 @login_required
+@permission_required(perm="asset.add_assetlot")
 def asset_batch_number_creation(request):
     """asset batch number creation view"""
     hx_vals = (

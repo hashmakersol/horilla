@@ -1146,6 +1146,7 @@ class HorillaMailTemplate(HorillaModel):
         on_delete=models.CASCADE,
         verbose_name=_("Company"),
     )
+    objects = HorillaCompanyManager(related_company_field="company_id")
 
     def __str__(self) -> str:
         return f"{self.title}"
@@ -1277,6 +1278,13 @@ class MultipleApprovalCondition(HorillaModel):
         verbose_name=_("Ending Value"),
     )
     objects = models.Manager()
+    company_id = models.ForeignKey(
+        Company,
+        null=True,
+        blank=True,
+        on_delete=models.CASCADE,
+        verbose_name=_("Company"),
+    )
 
     def __str__(self) -> str:
         return f"{self.condition_field} {self.condition_operator}"
@@ -1288,6 +1296,7 @@ class MultipleApprovalCondition(HorillaModel):
                 condition_field=self.condition_field,
                 condition_operator=self.condition_operator,
                 condition_value=self.condition_value,
+                company_id=self.company_id,
             ).exclude(id=self.pk)
             if instance:
                 raise ValidationError(
@@ -1546,7 +1555,9 @@ class DashboardEmployeeCharts(HorillaModel):
     from employee.models import Employee
 
     employee = models.ForeignKey(Employee, on_delete=models.CASCADE)
-    charts = models.JSONField(default=list, blank=True, null=True)
+    charts = models.JSONField(
+        verbose_name=_("Excluded Charts"), default=list, blank=True, null=True
+    )
 
     def __str__(self):
         return f"{self.employee} - charts"
@@ -1728,7 +1739,7 @@ def create_deduction_cutleave_from_penalty(sender, instance, created, **kwargs):
     if created:
         penalty_amount = instance.penalty_amount
         if apps.is_installed("payroll") and penalty_amount:
-            Deduction = get_horilla_model_class(app_label="payroll", model="Deduction")
+            Deduction = get_horilla_model_class(app_label="payroll", model="deduction")
             penalty = Deduction()
             if instance.late_early_id:
                 penalty.title = f"{instance.late_early_id.get_type_display()} penalty"

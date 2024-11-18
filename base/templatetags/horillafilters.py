@@ -87,11 +87,14 @@ def is_clocked_in(user):
         last_attendance = (
             employee.employee_attendances.all().order_by("attendance_date", "id").last()
         )
-        if last_attendance is not None:
+        if last_attendance is not None and last_attendance.attendance_clock_out:
             last_activity = employee.employee_attendance_activities.filter(
                 attendance_date=last_attendance.attendance_date
             ).last()
-            return False if last_activity is None else last_activity.clock_out is None
+            if not last_activity:
+                return False
+            return last_activity.clock_out is None
+        return True
     return False
 
 
@@ -286,3 +289,21 @@ def on_off(value):
         return _("Yes")
     elif value == "off":
         return _("No")
+
+
+@register.filter(name="currency_symbol_position")
+def currency_symbol_position(amount):
+    if apps.is_installed("payroll"):
+        PayrollSettings = get_horilla_model_class(
+            app_label="payroll", model="payrollsettings"
+        )
+    symbol = PayrollSettings.objects.first()
+
+    currency = symbol.currency_symbol if symbol else "$"
+
+    if symbol.position == "postfix":
+        currency_symbol = f"{amount} {currency}"
+    else:
+        currency_symbol = f"{currency} {amount}"
+
+    return currency_symbol

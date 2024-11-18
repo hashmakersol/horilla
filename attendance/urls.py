@@ -306,6 +306,11 @@ urlpatterns = [
         name="update-fields-based-shift",
     ),
     path(
+        "update-worked-hour-field",
+        views.update_worked_hour_field,
+        name="update-worked-hour-field",
+    ),
+    path(
         "update-date-details",
         views.form_date_checking,
         name="update-date-details",
@@ -314,6 +319,11 @@ urlpatterns = [
         "user-request-one-view/<int:id>",
         views.user_request_one_view,
         name="user-request-one-view",
+    ),
+    path(
+        "get-attendance-activities/<int:obj_id>",
+        views.get_attendance_activities,
+        name="get-attendance-activities",
     ),
     path(
         "hour-attendance-select/",

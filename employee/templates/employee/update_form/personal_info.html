@@ -11,6 +11,7 @@
     >
       <form action="" method="post" enctype="multipart/form-data">
         <div id="personalMessage"></div>
+        <input type="hidden" name="form" value="personal">
         {% csrf_token %}
         <div class="row">
           <div
@@ -60,7 +61,7 @@
         <span class="oh-modal__dialog-title" id="uploadPhotoModalLabel"
           >{% trans "Upload Photo" %}</span
         >
-        <button class="oh-modal__close" aria-label="Close">
+        <button class="oh-modal__close" aria-label="Close" id="closeModalBtn">
           <ion-icon name="close-outline"></ion-icon>
         </button>
       </div>
@@ -72,6 +73,7 @@
             hx-encoding="multipart/form-data"
             method="post"
             id="file-form"
+            onsubmit="return submitForm(event)"
           >
             <div class="oh-profile-section__modal-avatar ">
               <img
@@ -126,3 +128,9 @@
     </div>
   </div>
 </div>
+<script>
+  function submitForm(event) {
+    event.preventDefault();
+    $("#closeModalBtn").click();
+  }
+</script>

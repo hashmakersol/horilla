@@ -86,6 +86,7 @@ class SurveyTemplate(HorillaModel):
         blank=True,
         verbose_name=_("Company"),
     )
+    objects = HorillaCompanyManager("company_id")
 
     def __str__(self) -> str:
         return self.title
@@ -251,8 +252,15 @@ def create_initial_stage(sender, instance, created, **kwargs):
     This is post save method, used to create initial stage for the recruitment
     """
     if created:
+        applied_stage = Stage()
+        applied_stage.sequence = 0
+        applied_stage.recruitment_id = instance
+        applied_stage.stage = "Applied"
+        applied_stage.stage_type = "applied"
+        applied_stage.save()
+
         initial_stage = Stage()
-        initial_stage.sequence = 0
+        initial_stage.sequence = 1
         initial_stage.recruitment_id = instance
         initial_stage.stage = "Initial"
         initial_stage.stage_type = "initial"
@@ -266,6 +274,7 @@ class Stage(HorillaModel):
 
     stage_types = [
         ("initial", _("Initial")),
+        ("applied", _("Applied")),
         ("test", _("Test")),
         ("interview", _("Interview")),
         ("cancelled", _("Cancelled")),
@@ -437,6 +446,12 @@ class Candidate(HorillaModel):
     objects = HorillaCompanyManager(related_company_field="recruitment_id__company_id")
     last_updated = models.DateField(null=True, auto_now=True)
 
+    converted_employee_id.exclude_from_automation = True
+    mail_to_related_fields = [
+        ("stage_id__stage_managers__get_mail", "Stage Managers"),
+        ("recruitment_id__recruitment_managers__get_mail", "Recruitment Managers"),
+    ]
+
     def __str__(self):
         return f"{self.name}"
 
@@ -463,7 +478,7 @@ class Candidate(HorillaModel):
             f"https://ui-avatars.com/api/?name={self.get_full_name()}&background=random"
         )
         if self.profile:
-            full_filename = settings.MEDIA_ROOT + self.profile.name
+            full_filename = self.profile.name
 
             if default_storage.exists(full_filename):
                 url = self.profile.url
@@ -921,6 +936,7 @@ class InterviewSchedule(HorillaModel):
     completed = models.BooleanField(
         default=False, verbose_name=_("Is Interview Completed")
     )
+    objects = HorillaCompanyManager("candidate_id__recruitment_id__company_id")
 
     def __str__(self) -> str:
         return f"{self.candidate_id} -Interview."
