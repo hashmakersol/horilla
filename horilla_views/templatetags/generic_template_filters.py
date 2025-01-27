@@ -1,5 +1,5 @@
 """
-attendancefilters.py
+horilla_views/templatetags/generic_template_filters.py
 
 This module is used to write custom template filters.
 
@@ -139,3 +139,11 @@ def get_item(dictionary: dict, key: str):
     if dictionary:
         return dictionary.get(key, "")
     return ""
+
+
+@register.filter("get_id")
+def get_id(string: str):
+    """
+    Generate target/id for the generic delete summary
+    """
+    return string.split("-")[0].lower().replace(" ", "")

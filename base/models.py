@@ -11,7 +11,7 @@ from typing import Iterable
 import django
 from django.apps import apps
 from django.contrib import messages
-from django.contrib.auth.models import User
+from django.contrib.auth.models import AbstractUser, User
 from django.core.exceptions import ValidationError
 from django.db import models
 from django.db.models.signals import post_save
@@ -1386,7 +1386,12 @@ class MultipleApprovalCondition(HorillaModel):
             condition_id=self.pk
         ).order_by("sequence")
         for query in queryset:
-            employee = Employee.objects.get(id=query.employee_id)
+            emp_id = query.employee_id
+            employee = (
+                query.reporting_manager
+                if not emp_id
+                else Employee.objects.get(id=emp_id)
+            )
             managers.append(employee)
 
         return managers
@@ -1397,8 +1402,15 @@ class MultipleApprovalManagers(models.Model):
         MultipleApprovalCondition, on_delete=models.CASCADE
     )
     sequence = models.IntegerField(null=False, blank=False)
-    employee_id = models.IntegerField(null=False, blank=False)
+    employee_id = models.IntegerField(null=True, blank=True)
+    reporting_manager = models.CharField(max_length=100, null=True, blank=True)
     objects = models.Manager()
+
+    def get_manager(self):
+        manager = self.employee_id
+        if manager:
+            manager = self.reporting_manager.replace("_", " ").title()
+        return manager
 
 
 class DynamicPagination(models.Model):
@@ -1468,7 +1480,13 @@ class Announcement(HorillaModel):
     )
     department = models.ManyToManyField(Department, blank=True)
     job_position = models.ManyToManyField(JobPosition, blank=True)
+    company_id = models.ManyToManyField(
+        Company,
+        blank=True,
+        related_name="announcement",
+    )
     disable_comments = models.BooleanField(default=False)
+    objects = HorillaCompanyManager(related_company_field="company_id")
 
     def get_views(self):
         """
@@ -1500,6 +1518,7 @@ class AnnouncementComment(HorillaModel):
     announcement_id = models.ForeignKey(Announcement, on_delete=models.CASCADE)
     employee_id = models.ForeignKey(Employee, on_delete=models.CASCADE)
     comment = models.TextField(null=True, verbose_name=_("Comment"), max_length=255)
+    objects = models.Manager()
 
 
 class AnnouncementView(models.Model):
@@ -1511,6 +1530,7 @@ class AnnouncementView(models.Model):
     announcement = models.ForeignKey(Announcement, on_delete=models.CASCADE)
     viewed = models.BooleanField(default=False)
     created_at = models.DateTimeField(auto_now_add=True, null=True)
+    objects = models.Manager()
 
 
 class EmailLog(models.Model):
@@ -1636,7 +1656,6 @@ class Holidays(HorillaModel):
     company_id = models.ForeignKey(
         Company,
         null=True,
-        editable=False,
         on_delete=models.PROTECT,
         verbose_name=_("Company"),
     )
@@ -1645,15 +1664,27 @@ class Holidays(HorillaModel):
     def __str__(self):
         return self.name
 
+    def today_holidays(today=None) -> models.QuerySet:
+        """
+        Retrieve holidays that overlap with the given date (default is today).
+
+        Args:
+            today (date, optional): The date to check for holidays. Defaults to the current date.
+
+        Returns:
+            QuerySet: A queryset of `Holidays` instances where the given date falls between
+                    `start_date` and `end_date` (inclusive).
+        """
+        today = today or date.today()
+        return Holidays.objects.filter(start_date__lte=today, end_date__gte=today)
+
 
 class CompanyLeaves(HorillaModel):
     based_on_week = models.CharField(
         max_length=100, choices=WEEKS, blank=True, null=True
     )
     based_on_week_day = models.CharField(max_length=100, choices=WEEK_DAYS)
-    company_id = models.ForeignKey(
-        Company, null=True, editable=False, on_delete=models.PROTECT
-    )
+    company_id = models.ForeignKey(Company, null=True, on_delete=models.PROTECT)
     objects = HorillaCompanyManager(related_company_field="company_id")
 
     class Meta:
@@ -1731,6 +1762,15 @@ class PenaltyAccounts(HorillaModel):
         ordering = ["-created_at"]
 
 
+class NotificationSound(models.Model):
+    from employee.models import Employee
+
+    employee = models.OneToOneField(
+        Employee, on_delete=models.CASCADE, related_name="notification_sound"
+    )
+    sound_enabled = models.BooleanField(default=False)
+
+
 @receiver(post_save, sender=PenaltyAccounts)
 def create_deduction_cutleave_from_penalty(sender, instance, created, **kwargs):
     """
@@ -1778,3 +1818,6 @@ def create_deduction_cutleave_from_penalty(sender, instance, created, **kwargs):
                 )
 
             available.save()
+
+
+User.add_to_class("is_new_employee", models.BooleanField(default=False))

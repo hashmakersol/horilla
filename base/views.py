@@ -32,10 +32,12 @@ from django.template.loader import render_to_string
 from django.urls import reverse, reverse_lazy
 from django.utils import timezone
 from django.utils.html import strip_tags
+from django.utils.timezone import localdate
 from django.utils.translation import gettext as _
 from django.views.decorators.csrf import csrf_exempt
 from django.views.decorators.http import require_http_methods
 
+from accessibility.models import DefaultAccessibility
 from base.backends import ConfiguredEmailBackend
 from base.decorators import (
     shift_request_change_permission,
@@ -107,9 +109,12 @@ from base.methods import (
     filtersubordinates,
     filtersubordinatesemployeemodel,
     format_date,
+    generate_colors,
     get_key_instances,
     get_pagination,
     is_reportingmanager,
+    paginator_qry,
+    random_color_generator,
     sortby,
 )
 from base.models import (
@@ -147,13 +152,16 @@ from base.models import (
     WorkTypeRequestComment,
 )
 from employee.filters import EmployeeFilter
-from employee.forms import ActiontypeForm
+from employee.forms import ActiontypeForm, EmployeeGeneralSettingPrefixForm
 from employee.models import (
     Actiontype,
     DisciplinaryAction,
     Employee,
+    EmployeeGeneralSetting,
     EmployeeWorkInformation,
+    ProfileEditFeature,
 )
+from horilla import horilla_apps
 from horilla.decorators import (
     delete_permission,
     duplicate_permission,
@@ -164,9 +172,11 @@ from horilla.decorators import (
 )
 from horilla.group_by import group_by_queryset
 from horilla.horilla_settings import (
+    APPS,
     DB_INIT_PASSWORD,
     DYNAMIC_URL_PATTERNS,
     FILE_STORAGE,
+    NO_PERMISSION_MODALS,
 )
 from horilla.methods import get_horilla_model_class, remove_dynamic_url
 from horilla_audit.forms import HistoryTrackingFieldsForm
@@ -196,15 +206,6 @@ def is_reportingmanger(request, instance):
     except Exception:
         return HttpResponse("This Employee Dont Have any work information")
     return manager == employee_work_info_manager
-
-
-def paginator_qry(queryset, page_number):
-    """
-    Common paginator method
-    """
-    paginator = Paginator(queryset, get_pagination())
-    queryset = paginator.get_page(page_number)
-    return queryset
 
 
 def initialize_database_condition():
@@ -559,45 +560,49 @@ def initialize_job_position_delete(request, obj_id):
 
 def login_user(request):
     """
-    This method is used render login template and authenticate user
+    Handles user login and authentication.
     """
     if request.method == "POST":
-        username = request.POST["username"]
-        password = request.POST["password"]
-        next_url = request.GET.get("next")
+        username = request.POST.get("username")
+        password = request.POST.get("password")
+        next_url = request.GET.get("next", "/")
         query_params = request.GET.dict()
-        if "next" in query_params:
-            del query_params["next"]
+        query_params.pop("next", None)
+        params = urlencode(query_params)
 
-        params = f"{urlencode(query_params)}"
         user = authenticate(request, username=username, password=password)
-        if user is None:
+
+        if not user:
             user_object = User.objects.filter(username=username).first()
-            is_active = user_object.is_active if user_object else None
-            if is_active is True or is_active is None:
-                messages.error(request, _("Invalid username or password."))
+            if user_object and not user_object.is_active:
+                messages.warning(request, _("Access Denied: Your account is blocked."))
             else:
-                messages.warning(
-                    request,
-                    _("Access Denied: Your login credentials are currently blocked."),
-                )
-            return redirect("/login")
-        if user.employee_get.is_active == False:
+                messages.error(request, _("Invalid username or password."))
+            return redirect("login")
+
+        employee = getattr(user, "employee_get", None)
+        if employee is None:
+            messages.error(
+                request,
+                _("An employee related to this user's credentials does not exist."),
+            )
+            return redirect("login")
+        if not employee.is_active:
             messages.warning(
                 request,
                 _(
                     "This user is archived. Please contact the manager for more information."
                 ),
             )
-            return redirect("/login")
+            return redirect("login")
+
         login(request, user)
-        messages.success(request, _("Login Success"))
-        if next_url:
-            url = f"{next_url}"
-            if params:
-                url += f"?{params}"
-            return redirect(url)
-        return redirect("/")
+        messages.success(request, _("Login successful."))
+
+        if params:
+            next_url += f"?{params}"
+        return redirect(next_url)
+
     return render(
         request, "login.html", {"initialize_database": initialize_database_condition()}
     )
@@ -736,18 +741,20 @@ def change_password(request):
     user = request.user
     form = ChangePasswordForm(user=user)
     if request.method == "POST":
-        response = render(request, "base/auth/password_change.html", {"form": form})
         form = ChangePasswordForm(user, request.POST)
         if form.is_valid():
             new_password = form.cleaned_data["new_password"]
             user.set_password(new_password)
             user.save()
             user = authenticate(request, username=user.username, password=new_password)
+            if hasattr(user, "is_new_employee"):
+                user.is_new_employee = False
+                user.save()
             login(request, user)
             messages.success(request, _("Password changed successfully"))
-            return HttpResponse(
-                response.content.decode("utf-8") + "<script>location.reload();</script>"
-            )
+            return HttpResponse("<script>window.location.href='/';</script>")
+        return render(request, "base/auth/password_change_form.html", {"form": form})
+
     return render(request, "base/auth/password_change.html", {"form": form})
 
 
@@ -801,39 +808,9 @@ def home(request):
             and user.employee_get.dob.day == today.day
         )
 
-    announcements = Announcement.objects.all()
-    general_expire = AnnouncementExpire.objects.all().first()
-    general_expire_date = 30 if not general_expire else general_expire.days
-
-    for announcement in announcements.filter(expire_date__isnull=True):
-        calculated_expire_date = announcement.created_at + timedelta(
-            days=general_expire_date
-        )
-        announcement.expire_date = calculated_expire_date
-        announcement.save()
-
-        # Check if the user has viewed the announcement
-        announcement_view = AnnouncementView.objects.filter(
-            announcement=announcement, user=request.user
-        ).first()
-        announcement.has_viewed = (
-            announcement_view is not None and announcement_view.viewed
-        )
-
-    announcements = announcements.exclude(
-        expire_date__lt=datetime.today().date()
-    ).order_by("-created_at")
-
-    announcement_list = announcements.filter(employees=request.user.employee_get)
-    announcement_list = announcement_list | announcements.filter(employees__isnull=True)
-    if request.user.has_perm("base.view_announcement"):
-        announcement_list = announcements
-
     context = {
         "first_day_of_week": first_day_of_week.strftime("%Y-%m-%d"),
         "last_day_of_week": last_day_of_week.strftime("%Y-%m-%d"),
-        "announcement": announcement_list,
-        "general_expire_date": general_expire_date,
         "charts": employee_charts.charts,
         "is_birthday": is_birthday,
     }
@@ -934,21 +911,8 @@ def user_group_table(request):
     Group assign htmx view
     """
     permissions = []
-    apps = [
-        "base",
-        "recruitment",
-        "employee",
-        "leave",
-        "pms",
-        "onboarding",
-        "asset",
-        "attendance",
-        "payroll",
-        "auth",
-        "offboarding",
-        "horilla_documents",
-        "helpdesk",
-    ]
+    apps = APPS
+    no_permission_models = NO_PERMISSION_MODALS
     form = UserGroupForm()
     for app_name in apps:
         app_models = []
@@ -972,6 +936,7 @@ def user_group_table(request):
         {
             "permissions": permissions,
             "form": form,
+            "no_permission_models": no_permission_models,
         },
     )
 
@@ -1015,21 +980,8 @@ def user_group(request):
     """
     permissions = []
 
-    apps = [
-        "base",
-        "recruitment",
-        "employee",
-        "leave",
-        "pms",
-        "onboarding",
-        "asset",
-        "attendance",
-        "payroll",
-        "auth",
-        "offboarding",
-        "horilla_documents",
-        "helpdesk",
-    ]
+    apps = APPS
+    no_permission_models = NO_PERMISSION_MODALS
     form = UserGroupForm()
     for app_name in apps:
         app_models = []
@@ -1049,6 +1001,7 @@ def user_group(request):
             "permissions": permissions,
             "form": form,
             "groups": paginator_qry(groups, request.GET.get("page")),
+            "no_permission_models": no_permission_models,
         },
     )
 
@@ -1061,21 +1014,8 @@ def user_group_search(request):
     """
     permissions = []
 
-    apps = [
-        "base",
-        "recruitment",
-        "employee",
-        "leave",
-        "pms",
-        "onboarding",
-        "asset",
-        "attendance",
-        "payroll",
-        "auth",
-        "offboarding",
-        "horilla_documents",
-        "helpdesk",
-    ]
+    apps = APPS
+    no_permission_models = NO_PERMISSION_MODALS
     form = UserGroupForm()
     for app_name in apps:
         app_models = []
@@ -1098,6 +1038,7 @@ def user_group_search(request):
             "permissions": permissions,
             "form": form,
             "groups": paginator_qry(groups, request.GET.get("page")),
+            "no_permission_models": no_permission_models,
         },
     )
 
@@ -1292,6 +1233,7 @@ def object_duplicate(request, obj_id, **kwargs):
     template = kwargs["template"]
     original_object = model.objects.get(id=obj_id)
     form = form_class(instance=original_object)
+    searchWords = form.get_template_language()
     if request.method == "GET":
         for field_name, field in form.fields.items():
             if isinstance(field, forms.CharField):
@@ -1311,11 +1253,11 @@ def object_duplicate(request, obj_id, **kwargs):
             new_object.id = None
             new_object.save()
             return HttpResponse("<script>window.location.reload()</script>")
-
     context = {
         kwargs.get("form_name", "form"): form,
         "obj_id": obj_id,
         "duplicate": True,
+        "searchWords": searchWords,
     }
     return render(request, template, context)
 
@@ -1412,6 +1354,25 @@ def mail_server_conf(request):
 @permission_required("base.view_dynamicemailconfiguration")
 def mail_server_test_email(request):
     instance_id = request.GET.get("instance_id")
+    white_labelling = getattr(horilla_apps, "WHITE_LABELLING", False)
+    image_path = path.join(settings.STATIC_ROOT, "images/ui/horilla-logo.png")
+    company_name = "Horilla"
+
+    if white_labelling:
+        hq = Company.objects.filter(hq=True).last()
+        try:
+            company = (
+                request.user.employee_get.get_company()
+                if request.user.employee_get.get_company()
+                else hq
+            )
+        except:
+            company = hq
+
+        if company:
+            company_name = company.company
+            image_path = path.join(settings.MEDIA_ROOT, company.icon.name)
+
     form = DynamicMailTestForm()
     if request.method == "POST":
         form = DynamicMailTestForm(request.POST)
@@ -1420,26 +1381,26 @@ def mail_server_test_email(request):
             subject = _("Test mail from Horilla")
 
             # HTML content
-            html_content = """
+            html_content = f"""
             <html>
                 <body style="font-family: Arial, sans-serif; margin: 0; padding: 0;">
                     <table align="center" width="600" cellpadding="0" cellspacing="0" border="0" style="border: 1px solid #e0e0e0; border-radius: 10px; overflow: hidden;">
                         <tr>
                             <td align="center" bgcolor="#4CAF50" style="padding: 20px 0;">
-                                <h1 style="color: #ffffff; margin: 0;">Horilla</h1>
+                                <h1 style="color: #ffffff; margin: 0;">{company_name}</h1>
                             </td>
                         </tr>
                         <tr>
                             <td style="padding: 20px;">
                                 <h3 style="color: #4CAF50;">Email tested successfully</h3>
                                 <b><p style="font-size: 14px;">Hi,<br>
-                                    This email is being sent as part of mail sever testing from Horilla.</p></b>
+                                    This email is being sent as part of mail sever testing from {company_name}.</p></b>
                                 <img src="cid:unique_image_id" alt="Test Image" style="width: 200px; height: auto; margin: 20px 0;">
                             </td>
                         </tr>
                         <tr>
                             <td bgcolor="#f0f0f0" style="padding: 10px; text-align: center;">
-                                <p style="font-size: 12px; color: black;">&copy; 2024 Horilla, Inc.</p>
+                                <p style="font-size: 12px; color: black;">&copy; {datetime.today().year} {company_name}</p>
                             </td>
                         </tr>
                     </table>
@@ -1466,10 +1427,6 @@ def mail_server_test_email(request):
                 )
                 msg.attach_alternative(html_content, "text/html")
 
-                # Attach the image
-                image_path = path.join(
-                    settings.STATIC_ROOT, "images/ui/horilla-logo.png"
-                )
                 with open(image_path, "rb") as img:
                     msg_img = MIMEImage(img.read())
                     msg_img.add_header("Content-ID", "<unique_image_id>")
@@ -3137,19 +3094,23 @@ def employee_permission_assign(request):
         "helpdesk",
     ]
     installed_apps = [app for app in settings.INSTALLED_APPS if app in horilla_apps]
+
+    no_permission_models = NO_PERMISSION_MODALS
     for app_name in installed_apps:
         app_models = []
         for model in get_models_in_app(app_name):
-            app_models.append(
-                {
-                    "verbose_name": model._meta.verbose_name.capitalize(),
-                    "model_name": model._meta.model_name,
-                }
-            )
+            if model._meta.model_name not in no_permission_models:
+                app_models.append(
+                    {
+                        "verbose_name": model._meta.verbose_name.capitalize(),
+                        "model_name": model._meta.model_name,
+                    }
+                )
         permissions.append(
             {"app": app_name.capitalize().replace("_", " "), "app_models": app_models}
         )
     context["permissions"] = permissions
+    context["no_permission_models"] = no_permission_models
     context["employees"] = paginator_qry(employees, request.GET.get("page"))
     return render(
         request,
@@ -3176,21 +3137,7 @@ def employee_permission_search(request, codename=None, uid=None):
         ).distinct()
         context["show_assign"] = True
     permissions = []
-    apps = [
-        "base",
-        "recruitment",
-        "employee",
-        "leave",
-        "pms",
-        "onboarding",
-        "asset",
-        "attendance",
-        "payroll",
-        "auth",
-        "offboarding",
-        "horilla_documents",
-        "helpdesk",
-    ]
+    apps = APPS
     for app_name in apps:
         app_models = []
         for model in get_models_in_app(app_name):
@@ -3242,31 +3189,21 @@ def permission_table(request):
     This method is used to render the permission table
     """
     permissions = []
-    apps = [
-        "base",
-        "recruitment",
-        "employee",
-        "leave",
-        "pms",
-        "onboarding",
-        "asset",
-        "attendance",
-        "payroll",
-        "auth",
-        "offboarding",
-        "horilla_documents",
-        "helpdesk",
-    ]
+    apps = APPS
     form = AssignPermission()
+
+    no_permission_models = NO_PERMISSION_MODALS
+
     for app_name in apps:
         app_models = []
         for model in get_models_in_app(app_name):
-            app_models.append(
-                {
-                    "verbose_name": model._meta.verbose_name.capitalize(),
-                    "model_name": model._meta.model_name,
-                }
-            )
+            if model not in no_permission_models:
+                app_models.append(
+                    {
+                        "verbose_name": model._meta.verbose_name.capitalize(),
+                        "model_name": model._meta.model_name,
+                    }
+                )
         permissions.append({"app": app_name.capitalize(), "app_models": app_models})
     if request.method == "POST":
         form = AssignPermission(request.POST)
@@ -3280,6 +3217,7 @@ def permission_table(request):
         {
             "permissions": permissions,
             "form": form,
+            "no_permission_models": no_permission_models,
         },
     )
 
@@ -3413,6 +3351,33 @@ def work_type_request_search(request):
     )
 
 
+def handle_wtr_close_hx_url(request):
+    employee = request.user.employee_get.id
+    HTTP_REFERER = request.META.get("HTTP_REFERER", "")
+    previous_data = unquote(request.GET.urlencode().replace("pd=", ""))
+    close_hx_url = ""
+    close_hx_target = ""
+
+    if HTTP_REFERER and "/" + "/".join(HTTP_REFERER.split("/")[3:]) == "/":
+        close_hx_url = reverse("dashboard-work-type-request")
+        close_hx_target = "#WorkTypeRequestApproveBody"
+    elif HTTP_REFERER and HTTP_REFERER.endswith("work-type-request-view/"):
+        close_hx_url = f"/work-type-request-search?{previous_data}"
+        close_hx_target = "#view-container"
+    elif HTTP_REFERER and HTTP_REFERER.endswith("employee-profile/"):
+        close_hx_url = f"/employee/shift-tab/{employee}?profile=true"
+        close_hx_target = "#shift_target"
+    elif HTTP_REFERER:
+        HTTP_REFERERS = [part for part in HTTP_REFERER.split("/") if part]
+        try:
+            employee_id = int(HTTP_REFERERS[-1])
+            close_hx_url = f"/employee/shift-tab/{employee_id}"
+            close_hx_target = "#shift_target"
+        except ValueError:
+            pass
+    return close_hx_url, close_hx_target
+
+
 @login_required
 @hx_request_required
 def work_type_request(request):
@@ -3435,23 +3400,9 @@ def work_type_request(request):
 
     f = WorkTypeRequestFilter()
     context = {"f": f, "pd": previous_data}
-    HTTP_REFERER = request.META.get("HTTP_REFERER", None)
-    context["close_hx_url"] = ""
-    context["close_hx_target"] = ""
-    if HTTP_REFERER and HTTP_REFERER.endswith("work-type-request-view/"):
-        context["close_hx_url"] = f"/work-type-request-search?{previous_data}"
-        context["close_hx_target"] = "#view-container"
-    elif HTTP_REFERER and HTTP_REFERER.endswith("employee-profile/"):
-        context["close_hx_url"] = f"/employee/shift-tab/{employee}?profile=true"
-        context["close_hx_target"] = "#shift_target"
-    elif HTTP_REFERER:
-        HTTP_REFERERS = [part for part in HTTP_REFERER.split("/") if part]
-        try:
-            employee_id = int(HTTP_REFERERS[-1])
-            context["close_hx_url"] = f"/employee/shift-tab/{employee_id}"
-            context["close_hx_target"] = "#shift_target"
-        except ValueError:
-            pass
+    context["close_hx_url"], context["close_hx_target"] = handle_wtr_close_hx_url(
+        request
+    )
     if request.method == "POST":
         form = WorkTypeRequestForm(request.POST)
         form = choosesubordinates(
@@ -3494,17 +3445,36 @@ def work_type_request(request):
 
 def handle_wtr_redirect(request, work_type_request):
     hx_request = request.META.get("HTTP_HX_REQUEST") == "true"
-    current_url = request.META.get("HTTP_HX_CURRENT_URL")
-    if hx_request:
-        if current_url:
-            if "/work-type-request-view/" in current_url:
-                return redirect(f"/work-type-request-search?{request.GET.urlencode()}")
-            elif "/employee-view/" in current_url:
-                return redirect(
-                    f"/employee/shift-tab/{work_type_request.employee_id.id}"
-                )
+    if not hx_request:
+        return HttpResponseRedirect(request.META.get("HTTP_REFERER", "/"))
+
+    current_url = "/" + "/".join(
+        request.META.get("HTTP_HX_CURRENT_URL", "").split("/")[3:]
+    )
+    hx_target = request.META.get("HTTP_HX_TARGET")
+
+    if not current_url:
         return HttpResponse("<script>window.location.reload()</script>")
-    return HttpResponseRedirect(request.META.get("HTTP_REFERER", "/"))
+
+    if hx_target == "objectDetailsModalTarget":
+        instances_ids = request.GET.get("instances_ids")
+        dashboard = request.GET.get("dashboard")
+        url = reverse(
+            "work-type-request-single-view",
+            kwargs={"obj_id": work_type_request.id},
+        )
+        return redirect(f"{url}?instances_ids={instances_ids}&dashboard={dashboard}")
+
+    if current_url == "/":
+        return redirect(reverse("dashboard-work-type-request"))
+
+    if "/work-type-request-view/" in current_url:
+        return redirect(f"/work-type-request-search?{request.GET.urlencode()}")
+
+    if "/employee-view/" in current_url:
+        return redirect(f"/employee/shift-tab/{work_type_request.employee_id.id}")
+
+    return HttpResponse("<script>window.location.reload()</script>")
 
 
 @login_required
@@ -3775,11 +3745,11 @@ def work_type_request_delete(request, obj_id):
 
 
 @login_required
-def work_type_request_single_view(request, work_type_request_id):
+def work_type_request_single_view(request, obj_id):
     """
     This method is used to view details of an work type request
     """
-    work_type_request = WorkTypeRequest.objects.filter(id=work_type_request_id).first()
+    work_type_request = WorkTypeRequest.objects.filter(id=obj_id).first()
     context = {
         "work_type_request": work_type_request,
         "dashboard": request.GET.get("dashboard"),
@@ -3787,10 +3757,13 @@ def work_type_request_single_view(request, work_type_request_id):
     requests_ids_json = request.GET.get("instances_ids")
     if requests_ids_json:
         requests_ids = json.loads(requests_ids_json)
-        previous_id, next_id = closest_numbers(requests_ids, work_type_request_id)
+        previous_id, next_id = closest_numbers(requests_ids, obj_id)
         context["requests_ids"] = requests_ids_json
         context["previous"] = previous_id
         context["next"] = next_id
+    context["close_hx_url"], context["close_hx_target"] = handle_wtr_close_hx_url(
+        request
+    )
     return render(
         request,
         "work_type_request/htmx/work_type_request_single_view.html",
@@ -4904,11 +4877,25 @@ def general_settings(request):
         encashment_form = None
         currency_form = None
 
+    selected_company_id = request.session.get("selected_company")
+
+    if selected_company_id == "all" or not selected_company_id:
+        companies = Company.objects.all()
+    else:
+        companies = Company.objects.filter(id=selected_company_id)
+
+    # Fetch or create EmployeeGeneralSetting instance
+    prefix_instance = EmployeeGeneralSetting.objects.first()
+    prefix_form = EmployeeGeneralSettingPrefixForm(instance=prefix_instance)
     instance = AnnouncementExpire.objects.first()
     form = AnnouncementExpireForm(instance=instance)
     enabled_block_unblock = (
         AccountBlockUnblock.objects.exists()
         and AccountBlockUnblock.objects.first().is_enabled
+    )
+    enabled_profile_edit = (
+        ProfileEditFeature.objects.exists()
+        and ProfileEditFeature.objects.first().is_enabled
     )
     history_tracking_instance = HistoryTrackingFields.objects.first()
     history_fields_form_initial = {}
@@ -4942,6 +4929,10 @@ def general_settings(request):
             "history_fields_form": history_fields_form,
             "history_tracking_instance": history_tracking_instance,
             "enabled_block_unblock": enabled_block_unblock,
+            "enabled_profile_edit": enabled_profile_edit,
+            "prefix_form": prefix_form,
+            "companies": companies,
+            "selected_company_id": selected_company_id,
         },
     )
 
@@ -5110,21 +5101,65 @@ def history_field_settings(request):
     return redirect(general_settings)
 
 
+@login_required
+@permission_required("horilla_audit.change_accountblockunblock")
 def enable_account_block_unblock(request):
     if request.method == "POST":
-        enabled = request.POST.get("enable_block_account")
-        if enabled == "on":
-            enabled = True
-        else:
-            enabled = False
-        if AccountBlockUnblock.objects.exists():
-            instance = AccountBlockUnblock.objects.first()
+        enabled = request.POST.get("enable_block_account") == "on"
+        instance = AccountBlockUnblock.objects.first()
+        if instance:
             instance.is_enabled = enabled
-            messages.success(request, _("Settings updated."))
             instance.save()
         else:
             AccountBlockUnblock.objects.create(is_enabled=enabled)
+        messages.success(
+            request,
+            _(
+                f"Account block/unblock setting has been {'enabled' if enabled else 'disabled'}."
+            ),
+        )
+        if request.META.get("HTTP_HX_REQUEST"):
+            return HttpResponse()
         return redirect(general_settings)
+    return HttpResponse(status=405)
+
+
+from accessibility.accessibility import ACCESSBILITY_FEATURE
+
+
+@login_required
+@permission_required("employee.change_employee")
+def enable_profile_edit_feature(request):
+
+    if request.method == "POST":
+        enabled = request.POST.get("enable_profile_edit") == "on"
+        instance = ProfileEditFeature.objects.first()
+        feature = DefaultAccessibility.objects.filter(feature="profile_edit").first()
+        if instance:
+            instance.is_enabled = enabled
+            instance.save()
+        else:
+            ProfileEditFeature.objects.create(is_enabled=enabled)
+
+        if enabled and not feature:
+            DefaultAccessibility.objects.create(
+                feature="profile_edit", filter={"feature": ["profile_edit"]}
+            )
+
+        if enabled:
+            if not any(item[0] == "profile_edit" for item in ACCESSBILITY_FEATURE):
+                ACCESSBILITY_FEATURE.append(("profile_edit", _("Profile Edit Access")))
+        else:
+            ACCESSBILITY_FEATURE.pop()
+
+        messages.success(
+            request,
+            _(f"Profile edit feature has been {'enabled' if enabled else 'disabled'}."),
+        )
+        if request.META.get("HTTP_HX_REQUEST"):
+            return HttpResponse()
+        return redirect(general_settings)
+    return HttpResponse(status=405)
 
 
 @login_required
@@ -5498,8 +5533,11 @@ def add_more_approval_managers(request):
     if managers_count:
         managers_count = int(managers_count) + 1
         field_name = f"multi_approval_manager_{managers_count}"
-        form.fields[field_name] = forms.ModelChoiceField(
-            queryset=Employee.objects.all(),
+        choices = [("reporting_manager_id", _("Reporting Manager"))] + [
+            (employee.pk, str(employee)) for employee in Employee.objects.all()
+        ]
+        form.fields[field_name] = forms.ChoiceField(
+            choices=choices,
             widget=forms.Select(
                 attrs={
                     "class": "oh-select oh-select-2 mb-3",
@@ -5554,28 +5592,31 @@ def multiple_level_approval_create(request):
         department = Department.objects.get(id=dept_id)
         instance = MultipleApprovalCondition()
         if form.is_valid():
+            instance.department = department
+            instance.condition_field = condition_field
+            instance.condition_operator = condition_operator
+            instance.company_id = company
             if condition_operator != "range":
-                instance.department = department
-                instance.condition_field = condition_field
-                instance.condition_operator = condition_operator
                 instance.condition_value = condition_value
-                instance.company_id = company
             else:
-                instance.department = department
-                instance.condition_field = condition_field
-                instance.condition_operator = condition_operator
                 instance.condition_start_value = condition_start_value
                 instance.condition_end_value = condition_end_value
-                instance.company_id = company
+
             instance.save()
             sequence = 0
             for emp_id in condition_approval_managers:
                 sequence += 1
-                employee_id = int(emp_id)
+                reporting_manager = None
+                try:
+                    employee_id = int(emp_id)
+                except:
+                    employee_id = None
+                    reporting_manager = emp_id
                 MultipleApprovalManagers.objects.create(
                     condition_id=instance,
                     sequence=sequence,
                     employee_id=employee_id,
+                    reporting_manager=reporting_manager,
                 )
             form = MultipleApproveConditionForm()
             messages.success(
@@ -5594,8 +5635,11 @@ def edit_approval_managers(form, managers):
             form.initial["multi_approval_manager"] = manager.employee_id
         else:
             field_name = f"multi_approval_manager_{i}"
-            form.fields[field_name] = forms.ModelChoiceField(
-                queryset=Employee.objects.all(),
+            choices = [("reporting_manager_id", _("Reporting Manager"))] + [
+                (employee.pk, str(employee)) for employee in Employee.objects.all()
+            ]
+            form.fields[field_name] = forms.ChoiceField(
+                choices=choices,
                 label=_("Approval Manager {}").format(i),
                 widget=forms.Select(attrs={"class": "oh-select oh-select-2 mb-3"}),
                 required=False,
@@ -5627,11 +5671,17 @@ def multiple_level_approval_edit(request, condition_id):
             for key, value in request.POST.items():
                 if key.startswith("multi_approval_manager"):
                     sequence += 1
-                    employee_id = int(value)
+                    reporting_manager = None
+                    try:
+                        employee_id = int(value)
+                    except:
+                        employee_id = None
+                        reporting_manager = value
                     MultipleApprovalManagers.objects.create(
                         condition_id=instance,
                         sequence=sequence,
                         employee_id=employee_id,
+                        reporting_manager=reporting_manager,
                     )
     selected_company = request.session.get("selected_company")
     if selected_company != "all":
@@ -6079,6 +6129,8 @@ def pagination_settings_view(request):
             if pagination_form.is_valid():
                 pagination_form.save()
                 messages.success(request, _("Default pagination updated."))
+    if request.META.get("HTTP_HX_REQUEST"):
+        return HttpResponse()
     return HttpResponseRedirect(request.META.get("HTTP_REFERER", "/"))
 
 
@@ -6102,8 +6154,8 @@ def action_type_create(request):
     This method renders form and template to create Action Type
     """
     form = ActiontypeForm()
+    previous_data = request.GET.urlencode()
     dynamic = request.GET.get("dynamic")
-    hx_vals = request.GET.get("data")
     if request.method == "POST":
         form = ActiontypeForm(request.POST)
         if form.is_valid():
@@ -6122,8 +6174,7 @@ def action_type_create(request):
         "base/action_type/action_type_form.html",
         {
             "form": form,
-            "dynamic": dynamic,
-            "hx_vals": hx_vals,
+            "pd": previous_data,
         },
     )
 
@@ -6196,7 +6247,7 @@ def driver_viewed_status(request):
 
 
 @login_required
-def employee_charts(request):
+def dashboard_components_toggle(request):
     """
     This function is used to create personalized dashboard charts for employees
     """
@@ -6450,7 +6501,26 @@ def generate_error_report(error_list, error_data, file_name):
 
 @login_required
 @hx_request_required
-@permission_required("leave.add_holiday")
+def get_upcoming_holidays(request):
+    """
+    Retrieve and display a list of upcoming holidays for the current month and year.
+    """
+    today = localdate()  # This accounts for timezone-aware dates
+    current_month = today.month
+    current_year = today.year
+    holidays = Holidays.objects.filter(
+        Q(start_date__month=current_month, start_date__year=current_year)
+        & Q(start_date__gte=today)
+    )
+    colors = generate_colors(len(holidays))
+    for i, holiday in enumerate(holidays):
+        holiday.background_color = colors[i]
+    return render(request, "holiday/upcoming_holidays.html", {"holidays": holidays})
+
+
+@login_required
+@hx_request_required
+@permission_required("base.add_holidays")
 def holiday_creation(request):
     """
     function used to create holidays.
@@ -6463,16 +6533,13 @@ def holiday_creation(request):
     POST : return holiday view template
     """
 
-    query_string = request.GET.urlencode()
-    if query_string.startswith("pd="):
-        previous_data = unquote(query_string[len("pd=") :])
-    else:
-        previous_data = unquote(query_string)
+    previous_data = request.GET.urlencode()
     form = HolidayForm()
     if request.method == "POST":
         form = HolidayForm(request.POST)
         if form.is_valid():
             form.save()
+            form = HolidayForm()
             messages.success(request, _("New holiday created successfully.."))
             if Holidays.objects.filter().count() == 1:
                 return HttpResponse("<script>window.location.reload();</script>")
@@ -6775,8 +6842,8 @@ def holiday_filter(request):
 
 @login_required
 @hx_request_required
-@permission_required("base.change_holiday")
-def holiday_update(request, id):
+@permission_required("base.change_holidays")
+def holiday_update(request, obj_id):
     """
     function used to update holiday.
 
@@ -6793,7 +6860,7 @@ def holiday_update(request, id):
         previous_data = unquote(query_string[len("pd=") :])
     else:
         previous_data = unquote(query_string)
-    holiday = Holidays.objects.get(id=id)
+    holiday = Holidays.objects.get(id=obj_id)
     form = HolidayForm(instance=holiday)
     if request.method == "POST":
         form = HolidayForm(request.POST, instance=holiday)
@@ -6803,14 +6870,14 @@ def holiday_update(request, id):
     return render(
         request,
         "holiday/holiday_update_form.html",
-        {"form": form, "id": id, "pd": previous_data},
+        {"form": form, "id": obj_id, "pd": previous_data},
     )
 
 
 @login_required
 @hx_request_required
-@permission_required("base.delete_holiday")
-def holiday_delete(request, id):
+@permission_required("base.delete_holidays")
+def holiday_delete(request, obj_id):
     """
     function used to delete holiday.
 
@@ -6823,7 +6890,7 @@ def holiday_delete(request, id):
     """
     query_string = request.GET.urlencode()
     try:
-        Holidays.objects.get(id=id).delete()
+        Holidays.objects.get(id=obj_id).delete()
         messages.success(request, _("Holidays deleted successfully.."))
     except Holidays.DoesNotExist:
         messages.error(request, _("Holidays not found."))
@@ -6834,23 +6901,17 @@ def holiday_delete(request, id):
     return redirect(f"/holiday-filter?{query_string}")
 
 
+@login_required
 @require_http_methods(["POST"])
 @permission_required("base.delete_holiday")
 def bulk_holiday_delete(request):
     """
-    This method is used to delete bulk of holidays
+    Deletes multiple holidays based on IDs passed in the POST request.
     """
     ids = request.POST.getlist("ids")
-    del_ids = []
-    for holiday_id in ids:
-        try:
-            holiday = Holidays.objects.get(id=holiday_id)
-            holiday.delete()
-            del_ids.append(holiday_id)
-        except Exception as e:
-            messages.error(request, _("Holidays not found."))
+    deleted_count = Holidays.objects.filter(id__in=ids).delete()[0]
     messages.success(
-        request, _("{} Holidays have been successfully deleted.".format(len(del_ids)))
+        request, _("{} Holidays have been successfully deleted.".format(deleted_count))
     )
     return redirect("holiday-filter")
 
@@ -6892,7 +6953,7 @@ def holiday_select_filter(request):
 
 @login_required
 @hx_request_required
-@permission_required("base.add_companyleave")
+@permission_required("base.add_companyleaves")
 def company_leave_creation(request):
     """
     function used to create company leave.
@@ -6981,7 +7042,7 @@ def company_leave_filter(request):
 
 @login_required
 @hx_request_required
-@permission_required("base.change_companyleave")
+@permission_required("base.change_companyleaves")
 def company_leave_update(request, id):
     """
     function used to update company leave.
@@ -7010,7 +7071,7 @@ def company_leave_update(request, id):
 
 @login_required
 @hx_request_required
-@permission_required("base.delete_companyleave")
+@permission_required("base.delete_companyleaves")
 def company_leave_delete(request, id):
     """
     function used to create company leave.
